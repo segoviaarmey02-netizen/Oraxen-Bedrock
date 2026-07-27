@@ -33,10 +33,9 @@ final class JavaItemModelResolver {
         if (reference == null || reference.isBlank()) return new Result(null, List.of());
         String normalized = normalize(reference);
         int colon = normalized.indexOf(':');
-        Path definition = pack.root().resolve("assets")
-                .resolve(normalized.substring(0, colon))
-                .resolve("items")
-                .resolve(normalized.substring(colon + 1) + ".json");
+        Path definition = pack.findAsset(normalized.substring(0, colon),
+                "items/" + normalized.substring(colon + 1) + ".json");
+        if (definition == null) return new Result(null, List.of());
         if (!Files.isRegularFile(definition)) return new Result(null, List.of());
 
         JsonObject root = JsonSupport.readObject(definition);

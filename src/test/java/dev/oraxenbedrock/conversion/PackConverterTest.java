@@ -3,7 +3,9 @@ package dev.oraxenbedrock.conversion;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import dev.oraxenbedrock.config.BridgeConfig;
+import dev.oraxenbedrock.io.PackSource;
 import dev.oraxenbedrock.model.ConversionResult;
+import dev.oraxenbedrock.util.MinecraftVersion;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -82,6 +84,9 @@ class PackConverterTest {
         Path javaPack = oraxen.resolve("pack/pack.zip");
         Files.createDirectories(javaPack.getParent());
         try (ZipOutputStream zip = new ZipOutputStream(Files.newOutputStream(javaPack))) {
+            entry(zip, "pack.mcmeta", """
+                    {"pack":{"pack_format":32,"description":"Minecraft 1.20.5"}}
+                    """.getBytes(StandardCharsets.UTF_8));
             entry(zip, "assets/oraxen/textures/ruby.png", new byte[]{1, 2, 3});
             entry(zip, "assets/oraxen/textures/ruby_block.png",
                     animatedPng(16, 0xFFFF0000, 0xFF00FF00));
@@ -257,6 +262,10 @@ class PackConverterTest {
                 0xFFFF2030, 0xFF20FF60, 0xFF2060FF);
         byte[] emoji = png(16, 16, 0xFF28DC78);
         try (ZipOutputStream zip = new ZipOutputStream(Files.newOutputStream(javaPack))) {
+            entry(zip, "pack.mcmeta", """
+                    {"pack":{"description":"Modern pack",
+                      "min_format":[69,0],"max_format":[84,0]}}
+                    """.getBytes(StandardCharsets.UTF_8));
             entry(zip, "assets/oraxen/textures/night_disc.png", animatedTexture);
             entry(zip, "assets/oraxen/textures/night_disc.png.mcmeta", """
                     {"animation":{"frametime":3}}
@@ -419,6 +428,10 @@ class PackConverterTest {
         Path javaPack = oraxen.resolve("pack/pack.zip");
         Files.createDirectories(javaPack.getParent());
         try (ZipOutputStream zip = new ZipOutputStream(Files.newOutputStream(javaPack))) {
+            entry(zip, "pack.mcmeta", """
+                    {"pack":{"description":"Modern pack",
+                      "min_format":[69,0],"max_format":[84,0]}}
+                    """.getBytes(StandardCharsets.UTF_8));
             entry(zip, "pack.png", png(32, 32, 0xFF8844FF));
             entry(zip, "assets/oraxen/items/modern_blade.json", """
                     {"model":{"type":"minecraft:condition",
@@ -503,6 +516,54 @@ class PackConverterTest {
         assertEquals(2, report.get("languages").getAsInt());
         assertEquals(3, report.get("language_entries").getAsInt());
         assertTrue(report.get("validated_references").getAsInt() >= 4);
+        assertEquals("69-84", report.get("java_pack_format").getAsString());
+    }
+
+    @Test
+    void supportsMinecraft1205MetadataModernRangesAndPackOverlays() throws Exception {
+        Path packFile = temp.resolve("compatibility.zip");
+        try (ZipOutputStream zip = new ZipOutputStream(Files.newOutputStream(packFile))) {
+            entry(zip, "pack.mcmeta", """
+                    {
+                      "pack":{
+                        "pack_format":32,
+                        "supported_formats":{"min_inclusive":32,"max_inclusive":75},
+                        "description":"1.20.5 through 1.21.11"
+                      },
+                      "overlays":{"entries":[
+                        {"formats":{"min_inclusive":32,"max_inclusive":75},
+                         "directory":"compatible"},
+                        {"formats":{"min_inclusive":46,"max_inclusive":75},
+                         "directory":"future"}
+                      ]}
+                    }
+                    """.getBytes(StandardCharsets.UTF_8));
+            entry(zip, "assets/oraxen/textures/item/versioned.png",
+                    png(16, 16, 0xFFFF0000));
+            entry(zip, "compatible/assets/oraxen/textures/item/versioned.png",
+                    png(16, 16, 0xFF00FF00));
+            entry(zip, "future/assets/oraxen/textures/item/versioned.png",
+                    png(16, 16, 0xFF0000FF));
+        }
+
+        try (PackSource source = PackSource.open(packFile)) {
+            assertEquals(32, source.metadata().packFormat());
+            assertEquals(32, source.metadata().minFormat());
+            assertEquals(75, source.metadata().maxFormat());
+            assertEquals("32-75", source.metadata().description());
+            assertEquals(2, source.metadata().overlays().size());
+            assertEquals(1, source.metadata().activeOverlays().size());
+            assertEquals(2, source.assetRoots().size());
+            try (InputStream input = Files.newInputStream(
+                    source.findTexture("oraxen:item/versioned"))) {
+                assertEquals(0xFF00FF00, ImageIO.read(input).getRGB(8, 8));
+            }
+        }
+
+        assertTrue(MinecraftVersion.parse("1.20.5-R0.1-SNAPSHOT").supported());
+        assertTrue(MinecraftVersion.parse("1.21.11").supported());
+        assertTrue(MinecraftVersion.parse("26.2").supported());
+        assertFalse(MinecraftVersion.parse("1.20.4").supported());
     }
 
     private static byte[] cubeModel(String texture) {

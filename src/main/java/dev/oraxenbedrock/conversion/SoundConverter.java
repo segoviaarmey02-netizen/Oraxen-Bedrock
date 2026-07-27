@@ -44,8 +44,7 @@ final class SoundConverter {
         JsonObject definitions = new JsonObject();
         Set<String> copied = new HashSet<>();
 
-        Path assets = source.root().resolve("assets");
-        if (Files.isDirectory(assets)) {
+        for (Path assets : source.assetRoots()) {
             try (Stream<Path> paths = Files.walk(assets)) {
                 for (Path file : paths.filter(this::isSoundRegistry).sorted().toList()) {
                     try {
@@ -164,10 +163,9 @@ final class SoundConverter {
     }
 
     private Path findAudio(String namespace, String name) {
-        Path base = source.root().resolve("assets").resolve(namespace).resolve("sounds");
         for (String extension : List.of(".ogg", ".wav")) {
-            Path candidate = base.resolve(name + extension);
-            if (Files.isRegularFile(candidate)) return candidate;
+            Path candidate = source.findAsset(namespace, "sounds/" + name + extension);
+            if (candidate != null) return candidate;
         }
         return null;
     }

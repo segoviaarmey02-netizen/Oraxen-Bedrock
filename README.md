@@ -1,9 +1,16 @@
 # OraxenBedrock
 
-Paper/Bukkit addon for Minecraft Java **1.21.11** that converts Oraxen item and
-block assets into a Bedrock resource pack and installs it into Geyser.
+Paper/Bukkit addon for Minecraft Java **1.20.5 and newer** that converts Oraxen
+item and block assets into a Bedrock resource pack and installs it into Geyser.
+The plugin targets Java 21 and is compiled against the Paper 1.20.6 API so the
+oldest supported server family is continuously checked at build time.
 
-## What is generated
+`plugin.yml` declares `api-version: 1.20.5`; newer Paper/Spigot releases can
+load the same JAR. Runtime startup also parses the server version and refuses
+versions below 1.20.5 with a clear error instead of failing later during pack
+generation.
+
+## What is added?
 
 - `plugins/Geyser-Spigot/packs/OraxenBedrock.mcpack`
 - `plugins/Geyser-Spigot/custom_mappings/oraxen-items.json` (Geyser v2 items)
@@ -24,6 +31,16 @@ Conditional Java predicates have no direct Geyser mapping equivalent, so the
 converter chooses their first concrete model and records that approximation in
 the report. Both modern definitions and traditional `models/item` assets can
 therefore drive Bedrock geometry and icons.
+
+Resource-pack metadata is version-aware across the full supported range:
+
+- classic `pack_format` used by Minecraft 1.20.5/1.20.6;
+- `supported_formats` ranges;
+- modern numeric or array-based `min_format` / `max_format`;
+- `overlays.entries`, applied only when their declared format range includes
+  the pack's target format;
+- unknown future formats are accepted and reported instead of being rejected
+  by a hard-coded upper version limit.
 
 Custom audio is registered in Bedrock `sounds/sound_definitions.json`, not
 merely copied. Oraxen `sound.yml` categories and streaming flags are preserved,
@@ -112,7 +129,7 @@ Requires JDK 21+ and Maven:
 mvn clean package
 ```
 
-Install `target/OraxenBedrock-2.4.0.jar` alongside Oraxen and Geyser, set
+Install `target/OraxenBedrock-2.5.0.jar` alongside Oraxen and Geyser, set
 `gameplay.enable-custom-content: true` in Geyser, then restart the server.
 
 Commands:

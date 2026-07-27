@@ -2,6 +2,7 @@ package dev.oraxenbedrock;
 
 import dev.oraxenbedrock.config.BridgeConfig;
 import dev.oraxenbedrock.model.ConversionResult;
+import dev.oraxenbedrock.util.MinecraftVersion;
 import org.bukkit.ChatColor;
 import org.bukkit.command.*;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -20,9 +21,19 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
 
     @Override
     public void onEnable() {
+        MinecraftVersion serverVersion =
+                MinecraftVersion.parse(getServer().getMinecraftVersion());
+        if (!serverVersion.supported()) {
+            getLogger().severe("Minecraft " + serverVersion
+                    + " is not supported. Minimum version is 1.20.5.");
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
         saveDefaultConfig();
         saveBundledOverrideReadme();
         manager = new ConversionManager(this, BridgeConfig.load(this));
+        getLogger().info("Compatibility mode: Minecraft " + serverVersion
+                + " (supported range 1.20.5+)");
 
         PluginCommand command = getCommand("oraxenbedrock");
         if (command != null) {

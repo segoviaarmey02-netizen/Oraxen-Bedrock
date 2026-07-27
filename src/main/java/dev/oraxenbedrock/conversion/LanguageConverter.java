@@ -17,31 +17,35 @@ final class LanguageConverter {
 
     Result convert(PackSource source, Path bedrock, List<String> warnings) {
         Map<String, SortedMap<String, String>> languages = new TreeMap<>();
-        Path assets = source.root().resolve("assets");
-        if (!Files.isDirectory(assets)) return new Result(0, 0);
-        try (Stream<Path> paths = Files.walk(assets)) {
-            for (Path file : paths.filter(Files::isRegularFile).sorted().toList()) {
-                String normalized = file.toString().replace('\\', '/');
-                if (!normalized.contains("/lang/")) continue;
-                String name = file.getFileName().toString();
-                String locale;
-                if (name.endsWith(".json")) {
-                    locale = bedrockLocale(name.substring(0, name.length() - 5));
-                    JsonObject json = JsonSupport.readObject(file);
-                    SortedMap<String, String> values =
-                            languages.computeIfAbsent(locale, ignored -> new TreeMap<>());
-                    for (Map.Entry<String, JsonElement> entry : json.entrySet()) {
-                        if (entry.getValue().isJsonPrimitive())
-                            values.put(entry.getKey(), entry.getValue().getAsString());
-                    }
-                } else if (name.endsWith(".lang")) {
-                    locale = bedrockLocale(name.substring(0, name.length() - 5));
-                    SortedMap<String, String> values =
-                            languages.computeIfAbsent(locale, ignored -> new TreeMap<>());
-                    for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
-                        if (line.isBlank() || line.stripLeading().startsWith("#")) continue;
-                        int split = line.indexOf('=');
-                        if (split > 0) values.put(line.substring(0, split), line.substring(split + 1));
+        if (source.assetRoots().isEmpty()) return new Result(0, 0);
+        try {
+            for (Path assets : source.assetRoots()) {
+                try (Stream<Path> paths = Files.walk(assets)) {
+                    for (Path file : paths.filter(Files::isRegularFile).sorted().toList()) {
+                        String normalized = file.toString().replace('\\', '/');
+                        if (!normalized.contains("/lang/")) continue;
+                        String name = file.getFileName().toString();
+                        String locale;
+                        if (name.endsWith(".json")) {
+                            locale = bedrockLocale(name.substring(0, name.length() - 5));
+                            JsonObject json = JsonSupport.readObject(file);
+                            SortedMap<String, String> values =
+                                    languages.computeIfAbsent(locale, ignored -> new TreeMap<>());
+                            for (Map.Entry<String, JsonElement> entry : json.entrySet()) {
+                                if (entry.getValue().isJsonPrimitive())
+                                    values.put(entry.getKey(), entry.getValue().getAsString());
+                            }
+                        } else if (name.endsWith(".lang")) {
+                            locale = bedrockLocale(name.substring(0, name.length() - 5));
+                            SortedMap<String, String> values =
+                                    languages.computeIfAbsent(locale, ignored -> new TreeMap<>());
+                            for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+                                if (line.isBlank() || line.stripLeading().startsWith("#")) continue;
+                                int split = line.indexOf('=');
+                                if (split > 0)
+                                    values.put(line.substring(0, split), line.substring(split + 1));
+                            }
+                        }
                     }
                 }
             }

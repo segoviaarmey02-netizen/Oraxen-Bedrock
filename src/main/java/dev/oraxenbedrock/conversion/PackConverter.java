@@ -3,6 +3,7 @@ package dev.oraxenbedrock.conversion;
 import com.google.gson.*;
 import dev.oraxenbedrock.config.BridgeConfig;
 import dev.oraxenbedrock.io.PackSource;
+import dev.oraxenbedrock.io.JavaPackMetadata;
 import dev.oraxenbedrock.model.ConversionResult;
 import dev.oraxenbedrock.model.OraxenItem;
 import dev.oraxenbedrock.util.Maps;
@@ -37,6 +38,10 @@ public final class PackConverter {
         int copiedTextures = 0;
         int blockCount = 0;
         try (PackSource source = PackSource.open(config.javaPack())) {
+            JavaPackMetadata javaPackMetadata = source.metadata();
+            if (javaPackMetadata.predatesSupportedRange())
+                warnings.add("Java resource pack format " + javaPackMetadata.description()
+                        + " predates Minecraft 1.20.5; conversion is best-effort");
             writeManifest(bedrock, config);
 
             JsonObject itemTexture = textureAtlas(config.packName(), "atlas.items");
@@ -247,7 +252,7 @@ public final class PackConverter {
                     equipmentCount, soundEventCount, soundFileCount, glyphCount,
                     glyphPageCount, languageCount, languageEntryCount,
                     animationConverter.installedAnimations(), validation.checkedReferences(),
-                    warnings, packTarget);
+                    javaPackMetadata, warnings, packTarget);
             return new ConversionResult(Instant.now(), items.size(), blockCount, copiedTextures,
                     packTarget, itemTarget, List.copyOf(warnings));
         } finally {
@@ -277,30 +282,42 @@ public final class PackConverter {
 
     private Map<String, List<BlockVariant>> readBlockStates(PackSource source, List<String> warnings) {
         Map<String, List<BlockVariant>> modelToState = new HashMap<>();
-        Path assets = source.root().resolve("assets");
-        if (!Files.isDirectory(assets)) return modelToState;
-        try (Stream<Path> namespaces = Files.list(assets)) {
-            for (Path namespaceRoot : namespaces.filter(Files::isDirectory).sorted().toList()) {
-                Path blockstates = namespaceRoot.resolve("blockstates");
-                if (!Files.isDirectory(blockstates)) continue;
-                String namespace = namespaceRoot.getFileName().toString();
-                try (Stream<Path> paths = Files.walk(blockstates)) {
-                    for (Path path : paths.filter(p -> p.toString().endsWith(".json")).toList()) {
-                        JsonObject root = JsonSupport.readObject(path);
-                        JsonObject variants = root.getAsJsonObject("variants");
-                        String relative = blockstates.relativize(path).toString()
-                                .replace('\\', '/').replaceFirst("\\.json$", "");
-                        String base = namespace + ":" + relative;
-                        if (variants != null) {
-                            variants.entrySet().forEach(entry ->
-                                    addVariants(modelToState, base, namespace,
-                                            entry.getKey(), entry.getValue()));
+        if (source.assetRoots().isEmpty()) return modelToState;
+        try {
+            Map<String, Path> stateFiles = new LinkedHashMap<>();
+            for (Path assets : source.assetRoots()) {
+                try (Stream<Path> namespaces = Files.list(assets)) {
+                    for (Path namespaceRoot : namespaces.filter(Files::isDirectory).sorted().toList()) {
+                        Path blockstates = namespaceRoot.resolve("blockstates");
+                        if (!Files.isDirectory(blockstates)) continue;
+                        String namespace = namespaceRoot.getFileName().toString();
+                        try (Stream<Path> paths = Files.walk(blockstates)) {
+                            for (Path path : paths.filter(p -> p.toString().endsWith(".json")).toList()) {
+                                String relative = blockstates.relativize(path).toString()
+                                        .replace('\\', '/');
+                                stateFiles.put(namespace + ":" + relative, path);
+                            }
                         }
-                        JsonArray multipart = root.getAsJsonArray("multipart");
-                        if (multipart != null)
-                            readMultipart(modelToState, base, namespace, multipart);
                     }
                 }
+            }
+            for (Map.Entry<String, Path> stateFile : stateFiles.entrySet()) {
+                Path path = stateFile.getValue();
+                int separator = stateFile.getKey().indexOf(':');
+                String namespace = stateFile.getKey().substring(0, separator);
+                String relative = stateFile.getKey().substring(separator + 1)
+                        .replaceFirst("\\.json$", "");
+                String base = namespace + ":" + relative;
+                JsonObject root = JsonSupport.readObject(path);
+                JsonObject variants = root.getAsJsonObject("variants");
+                if (variants != null) {
+                    variants.entrySet().forEach(entry ->
+                            addVariants(modelToState, base, namespace,
+                                    entry.getKey(), entry.getValue()));
+                }
+                JsonArray multipart = root.getAsJsonArray("multipart");
+                if (multipart != null)
+                    readMultipart(modelToState, base, namespace, multipart);
             }
         } catch (IOException | RuntimeException ex) {
             warnings.add("Could not inspect generated blockstates: " + ex.getMessage());
@@ -518,9 +535,9 @@ public final class PackConverter {
         if (resolvedModel != null) {
             String model = normalizeModel(resolvedModel, resolvedModel);
             int colon = model.indexOf(':');
-            Path json = source.root().resolve("assets").resolve(model.substring(0, colon))
-                    .resolve("models").resolve(model.substring(colon + 1) + ".json");
-            if (Files.isRegularFile(json)) {
+            Path json = source.findAsset(model.substring(0, colon),
+                    "models/" + model.substring(colon + 1) + ".json");
+            if (json != null && Files.isRegularFile(json)) {
                 JsonObject textures = JsonSupport.readObject(json).getAsJsonObject("textures");
                 if (textures != null) for (Map.Entry<String, JsonElement> entry : textures.entrySet()) {
                     if (!entry.getValue().isJsonPrimitive()) continue;
@@ -534,8 +551,10 @@ public final class PackConverter {
 
     private void copyMatching(PackSource source, Path bedrock, Predicate<Path> predicate,
                               List<String> warnings) {
-        try (Stream<Path> paths = source.files()) {
-            for (Path sourceFile : paths.filter(predicate).toList()) {
+        try {
+            for (Path assets : source.assetRoots()) {
+                try (Stream<Path> paths = Files.walk(assets)) {
+                    for (Path sourceFile : paths.filter(predicate).toList()) {
                 String normalized = sourceFile.toString().replace('\\', '/');
                 String marker = normalized.contains("/textures/gui/") ? "/textures/gui/" : "/sounds/";
                 int index = normalized.indexOf(marker);
@@ -546,6 +565,8 @@ public final class PackConverter {
                         ? bedrock.resolve("textures/ui").resolve(namespace).resolve(relative)
                         : bedrock.resolve("sounds/oraxen").resolve(relative);
                 copy(sourceFile, target);
+                    }
+                }
             }
         } catch (IOException ex) {
             warnings.add("Could not copy UI/sound assets: " + ex.getMessage());
@@ -597,10 +618,15 @@ public final class PackConverter {
                              int soundFileCount, int glyphCount, int glyphPageCount,
                              int languageCount, int languageEntryCount,
                              int animatedTextureCount, int validatedReferences,
+                             JavaPackMetadata javaPackMetadata,
                              List<String> warnings, Path target) throws IOException {
         JsonObject report = new JsonObject();
         report.addProperty("generated_at", Instant.now().toString());
         report.addProperty("java_pack", config.javaPack().toString());
+        report.addProperty("java_pack_format", javaPackMetadata.description());
+        report.addProperty("java_pack_overlays_declared", javaPackMetadata.overlays().size());
+        report.addProperty("java_pack_overlays_applied", javaPackMetadata.activeOverlays().size());
+        report.addProperty("supported_java_servers", "1.20.5+");
         report.addProperty("geyser_pack", target.toString());
         report.addProperty("items", itemCount);
         report.addProperty("blocks", blockCount);

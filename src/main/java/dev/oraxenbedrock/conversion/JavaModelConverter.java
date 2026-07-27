@@ -330,8 +330,11 @@ final class JavaModelConverter {
 
     private Path modelPath(String model) {
         int colon = model.indexOf(':');
-        return pack.root().resolve("assets").resolve(model.substring(0, colon))
-                .resolve("models").resolve(model.substring(colon + 1) + ".json");
+        String namespace = model.substring(0, colon);
+        String relative = "models/" + model.substring(colon + 1) + ".json";
+        Path found = pack.findAsset(namespace, relative);
+        return found != null ? found : pack.root().resolve("assets")
+                .resolve(namespace).resolve(relative);
     }
 
     private String resolveAlias(String key, Map<String, String> textures, Set<String> seen) {

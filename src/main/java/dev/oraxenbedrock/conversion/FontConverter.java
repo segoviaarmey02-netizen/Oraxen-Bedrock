@@ -35,24 +35,25 @@ final class FontConverter {
 
     Result convert(List<String> warnings) throws IOException {
         Map<Integer, Map<Integer, BufferedImage>> pages = new TreeMap<>();
-        Path assets = source.root().resolve("assets");
-        if (!Files.isDirectory(assets)) return new Result(0, 0);
+        if (source.assetRoots().isEmpty()) return new Result(0, 0);
 
-        try (Stream<Path> paths = Files.walk(assets)) {
-            for (Path file : paths.filter(this::isFontDefinition).sorted().toList()) {
-                try {
-                    JsonArray providers = JsonSupport.readObject(file).getAsJsonArray("providers");
-                    if (providers == null) continue;
-                    for (JsonElement value : providers) {
-                        if (!value.isJsonObject()) continue;
-                        JsonObject provider = value.getAsJsonObject();
-                        if (!provider.has("type")
-                                || !provider.get("type").getAsString().equals("bitmap"))
-                            continue;
-                        readProvider(provider, pages, warnings);
+        for (Path assets : source.assetRoots()) {
+            try (Stream<Path> paths = Files.walk(assets)) {
+                for (Path file : paths.filter(this::isFontDefinition).sorted().toList()) {
+                    try {
+                        JsonArray providers = JsonSupport.readObject(file).getAsJsonArray("providers");
+                        if (providers == null) continue;
+                        for (JsonElement value : providers) {
+                            if (!value.isJsonObject()) continue;
+                            JsonObject provider = value.getAsJsonObject();
+                            if (!provider.has("type")
+                                    || !provider.get("type").getAsString().equals("bitmap"))
+                                continue;
+                            readProvider(provider, pages, warnings);
+                        }
+                    } catch (IOException | RuntimeException ex) {
+                        warnings.add("Could not convert bitmap font " + file + ": " + ex.getMessage());
                     }
-                } catch (IOException | RuntimeException ex) {
-                    warnings.add("Could not convert bitmap font " + file + ": " + ex.getMessage());
                 }
             }
         }
@@ -148,9 +149,7 @@ final class FontConverter {
             clean = clean.substring(colon + 1);
         }
         clean = clean.replaceFirst("^textures/", "");
-        Path texture = source.root().resolve("assets").resolve(namespace)
-                .resolve("textures").resolve(clean);
-        return Files.isRegularFile(texture) ? texture : null;
+        return source.findAsset(namespace, "textures/" + clean);
     }
 
     private boolean isFontDefinition(Path path) {
