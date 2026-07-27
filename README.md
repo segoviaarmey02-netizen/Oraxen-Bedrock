@@ -1,5 +1,7 @@
 # OraxenBedrock
 
+![OraxenBedrock plugin icon](branding/oraxenbedrock-icon.png)
+
 Paper/Bukkit addon for Minecraft Java **1.20.5 and newer** that converts Oraxen
 item and block assets into a Bedrock resource pack and installs it into Geyser.
 The plugin targets Java 21 and is compiled against the Paper 1.20.6 API so the
