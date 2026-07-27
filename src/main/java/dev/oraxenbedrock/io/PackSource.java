@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.file.*;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.stream.Stream;
 
 public final class PackSource implements AutoCloseable {
@@ -53,33 +54,52 @@ public final class PackSource implements AutoCloseable {
 
     /** Finds an asset with the last declared overlay taking precedence. */
     public Path findAsset(String namespace, String relative) {
+        if (!validNamespace(namespace) || unsafeRelative(relative)) return null;
         for (int i = assetRoots.size() - 1; i >= 0; i--) {
-            Path candidate = assetRoots.get(i).resolve(namespace).resolve(relative);
+            Path namespaceRoot = assetRoots.get(i).resolve(namespace).normalize();
+            Path candidate = namespaceRoot.resolve(relative).normalize();
+            if (!candidate.startsWith(namespaceRoot)) continue;
             if (Files.isRegularFile(candidate)) return candidate;
         }
         return null;
     }
 
     public Path findTexture(String reference) throws IOException {
+        return findTexture(reference, "minecraft");
+    }
+
+    public Path findTexture(String reference, String defaultNamespace) throws IOException {
         if (reference == null || reference.isBlank()) return null;
-        String normalized = reference.replace('\\', '/').replace(".png", "");
-        String namespace = "minecraft";
+        String normalized = reference.replace('\\', '/').replaceFirst("(?i)\\.png$", "");
+        String namespace = defaultNamespace;
         String name = normalized;
         int colon = normalized.indexOf(':');
         if (colon >= 0) {
             namespace = normalized.substring(0, colon);
             name = normalized.substring(colon + 1);
         }
+        namespace = namespace.toLowerCase(Locale.ROOT);
+        if (!validNamespace(namespace) || unsafeRelative(name)) return null;
         name = name.replaceFirst("^textures/", "");
         for (String prefix : List.of("", "item/", "items/", "block/", "blocks/", "gui/")) {
             Path exact = findAsset(namespace, "textures/" + prefix + name + ".png");
             if (exact != null) return exact;
         }
-        String fileName = Path.of(name).getFileName() + ".png";
+        Path namePath;
+        try {
+            namePath = Path.of(name);
+        } catch (InvalidPathException exception) {
+            return null;
+        }
+        String fileName = namePath.getFileName() + ".png";
         for (int i = assetRoots.size() - 1; i >= 0; i--) {
-            try (Stream<Path> paths = Files.walk(assetRoots.get(i))) {
+            Path namespaceRoot = assetRoots.get(i).resolve(namespace).normalize();
+            if (!namespaceRoot.startsWith(assetRoots.get(i)) || !Files.isDirectory(namespaceRoot))
+                continue;
+            try (Stream<Path> paths = Files.walk(namespaceRoot)) {
                 Path found = paths.filter(Files::isRegularFile)
                         .filter(p -> p.getFileName().toString().equalsIgnoreCase(fileName))
+                        .sorted()
                         .findFirst().orElse(null);
                 if (found != null) return found;
             }
@@ -94,5 +114,14 @@ public final class PackSource implements AutoCloseable {
     @Override
     public void close() throws IOException {
         if (zipFileSystem != null) zipFileSystem.close();
+    }
+
+    private static boolean validNamespace(String namespace) {
+        return namespace != null && namespace.matches("[a-z0-9_.-]+");
+    }
+
+    private static boolean unsafeRelative(String value) {
+        if (value == null || value.isBlank() || value.startsWith("/")) return true;
+        return java.util.Arrays.stream(value.split("/")).anyMatch(".."::equals);
     }
 }

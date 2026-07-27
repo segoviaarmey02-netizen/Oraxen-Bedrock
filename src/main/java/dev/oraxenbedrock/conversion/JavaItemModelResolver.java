@@ -19,7 +19,7 @@ import java.util.Locale;
  * concrete branch and report that approximation.
  */
 final class JavaItemModelResolver {
-    record Result(String model, List<String> warnings) {}
+    record Result(String model, boolean definitionFound, List<String> warnings) {}
 
     private final PackSource pack;
     private final String defaultNamespace;
@@ -30,13 +30,14 @@ final class JavaItemModelResolver {
     }
 
     Result resolve(String reference) throws IOException {
-        if (reference == null || reference.isBlank()) return new Result(null, List.of());
+        if (reference == null || reference.isBlank())
+            return new Result(null, false, List.of());
         String normalized = normalize(reference);
         int colon = normalized.indexOf(':');
         Path definition = pack.findAsset(normalized.substring(0, colon),
                 "items/" + normalized.substring(colon + 1) + ".json");
-        if (definition == null) return new Result(null, List.of());
-        if (!Files.isRegularFile(definition)) return new Result(null, List.of());
+        if (definition == null || !Files.isRegularFile(definition))
+            return new Result(null, false, List.of());
 
         JsonObject root = JsonSupport.readObject(definition);
         JsonElement node = root.has("model") ? root.get("model") : root;
@@ -44,7 +45,7 @@ final class JavaItemModelResolver {
         String model = findModel(node, warnings, 0);
         if (model == null)
             warnings.add("Modern item definition has no convertible model: " + normalized);
-        return new Result(model, List.copyOf(warnings));
+        return new Result(model, true, List.copyOf(warnings));
     }
 
     private String findModel(JsonElement node, List<String> warnings, int depth) {
@@ -84,7 +85,7 @@ final class JavaItemModelResolver {
             if (child == null) continue;
             if (child.isJsonPrimitive() && key.equals("model")) {
                 String value = primitive(child);
-                if (value != null && value.contains(":")) return normalize(value);
+                if (value != null) return normalize(value);
                 continue;
             }
             String found = findModel(child, warnings, depth + 1);

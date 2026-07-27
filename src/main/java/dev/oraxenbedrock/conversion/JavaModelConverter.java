@@ -124,8 +124,9 @@ final class JavaModelConverter {
         JsonObject json = JsonSupport.readObject(path);
         Resolved parent = null;
         if (json.has("parent")) {
-            String parentName = normalize(json.get("parent").getAsString());
+            String parentName = normalizeParent(json.get("parent").getAsString());
             if (!BUILTIN_PARENTS.contains(parentName)) parent = resolve(parentName, chain, warnings);
+            else parent = builtinModel(parentName);
         }
         Map<String, String> textures = parent == null
                 ? new LinkedHashMap<>() : new LinkedHashMap<>(parent.textures);
@@ -353,6 +354,12 @@ final class JavaModelConverter {
         String value = model.replace('\\', '/').replace(".json", "")
                 .replaceFirst("^assets/", "").replaceFirst("^models/", "");
         return value.contains(":") ? value : namespace + ":" + value;
+    }
+
+    private String normalizeParent(String model) {
+        String value = model.replace('\\', '/').replace(".json", "")
+                .replaceFirst("^assets/", "").replaceFirst("^models/", "");
+        return value.contains(":") ? value : "minecraft:" + value;
     }
 
     private String geometryId(String itemId) {

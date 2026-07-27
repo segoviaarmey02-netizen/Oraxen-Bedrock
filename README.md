@@ -132,6 +132,8 @@ mvn clean package
 
 Install `target/OraxenBedrock-2.5.0.jar` alongside Oraxen and Geyser, set
 `gameplay.enable-custom-content: true` in Geyser, then restart the server.
+The declared plugin initialization order is Oraxen, OraxenBedrock, then
+Geyser-Spigot.
 
 Commands:
 

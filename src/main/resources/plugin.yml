@@ -4,7 +4,7 @@ main: dev.oraxenbedrock.OraxenBedrockPlugin
 api-version: '1.20.5'
 load: POSTWORLD
 depend: [Oraxen]
-softdepend: [Geyser-Spigot]
+loadbefore: [Geyser-Spigot]
 authors: [djx3ui]
 description: Automatically builds and installs a Bedrock pack and Geyser mappings from Oraxen.
 commands:

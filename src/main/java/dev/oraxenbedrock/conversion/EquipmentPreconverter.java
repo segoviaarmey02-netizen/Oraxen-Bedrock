@@ -56,7 +56,15 @@ final class EquipmentPreconverter {
             return 0;
         }
 
-        JsonObject equippable = new JsonObject();
+        JsonObject equippable = components.has("minecraft:equippable")
+                && components.get("minecraft:equippable").isJsonObject()
+                ? components.getAsJsonObject("minecraft:equippable").deepCopy()
+                : new JsonObject();
+        // "model" is Oraxen's equipment-asset shortcut rather than a Java
+        // equippable field. Geyser also cannot translate these two fields.
+        equippable.remove("model");
+        equippable.remove("camera_overlay");
+        equippable.remove("swappable");
         equippable.addProperty("slot", slot);
         components.add("minecraft:equippable", equippable);
         int protection = protectionValue(item.material(), slot);
@@ -277,7 +285,7 @@ final class EquipmentPreconverter {
                     ? List.of(name + "_armor_layer_2", name + "_layer_2")
                     : List.of(name + "_armor_layer_1", name + "_layer_1");
         for (String candidate : candidates) {
-            Path texture = source.findTexture(candidate);
+            Path texture = source.findTexture(candidate, namespace);
             if (texture != null) return texture;
         }
         return null;

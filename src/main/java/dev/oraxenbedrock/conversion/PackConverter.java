@@ -55,6 +55,7 @@ public final class PackConverter {
 
             Map<String, List<BlockVariant>> modelStates = readBlockStates(source, warnings);
             Map<String, JsonObject> blockGroups = new LinkedHashMap<>();
+            Map<String, String> mappedBlockStates = new HashMap<>();
             JavaModelConverter modelConverter = new JavaModelConverter(source, config.namespace());
             JavaItemModelResolver itemModelResolver =
                     new JavaItemModelResolver(source, config.namespace());
@@ -78,14 +79,15 @@ public final class PackConverter {
                     throw new IOException("Oraxen item identifiers collide after Bedrock sanitization: "
                             + bedrockId);
                 String resolvedModel = modelReference(item);
-                if (item.itemModel() != null) {
-                    JavaItemModelResolver.Result modern = itemModelResolver.resolve(item.itemModel());
-                    warnings.addAll(modern.warnings().stream()
-                            .map(w -> item.id() + ": " + w).toList());
-                    if ((resolvedModel == null || resolvedModel.isBlank()) && modern.model() != null)
-                        resolvedModel = modern.model();
-                }
-                Path texture = findItemTexture(source, item, resolvedModel);
+                String itemModelReference = item.itemModel() == null
+                        ? config.namespace() + ":" + item.id() : item.itemModel();
+                JavaItemModelResolver.Result modern =
+                        itemModelResolver.resolve(itemModelReference);
+                warnings.addAll(modern.warnings().stream()
+                        .map(w -> item.id() + ": " + w).toList());
+                if ((resolvedModel == null || resolvedModel.isBlank()) && modern.model() != null)
+                    resolvedModel = modern.model();
+                Path texture = findItemTexture(source, item, resolvedModel, config.namespace());
                 JavaModelConverter.ConvertedModel convertedModel = null;
                 try {
                     convertedModel = modelConverter.convert(resolvedModel, safeId);
@@ -104,13 +106,20 @@ public final class PackConverter {
 
                 if (config.convertItems()) {
                     JsonObject definition = new JsonObject();
-                    boolean legacy = item.excludeFromItemModel() && item.customModelData() != null;
+                    boolean legacy = item.customModelData() != null
+                            && (item.excludeFromItemModel() || !modern.definitionFound());
                     definition.addProperty("type", legacy ? "legacy" : "definition");
-                    String javaModel = normalizeModel(item.itemModel(), config.namespace() + ":" + safeId);
+                    String javaModel = normalizeModel(item.itemModel(),
+                            config.namespace() + ":" + safeId);
                     if (!legacy)
                         definition.addProperty("model", javaModel);
                     else
                         definition.addProperty("custom_model_data", item.customModelData());
+                    if (!legacy && !modern.definitionFound())
+                        warnings.add("Item '" + item.id() + "' has no generated Java item definition"
+                                + (item.customModelData() == null
+                                ? " or custom_model_data; its Geyser mapping may not match"
+                                : ""));
                     definition.addProperty("bedrock_identifier", bedrockId);
                     definition.addProperty("display_name", plainText(item.displayName()));
                     JsonObject options = new JsonObject();
@@ -126,7 +135,7 @@ public final class PackConverter {
                         warnings.add("Equipment pre-conversion failed for '" + item.id()
                                 + "': " + ex.getMessage());
                     }
-                    addArrayValue(mappedItems, "minecraft:" + item.material().toLowerCase(Locale.ROOT), definition);
+                    addArrayValue(mappedItems, javaIdentifier(item.material()), definition);
 
                     if (texture != null) {
                         Path destination = bedrock.resolve("textures/items").resolve(safeId + ".png");
@@ -182,6 +191,15 @@ public final class PackConverter {
                         String stateProperties = state.substring(state.indexOf('[') + 1, state.length() - 1);
                         JsonObject group = blockGroups.computeIfAbsent(baseBlock,
                                 ignored -> newBlockGroup(config, baseBlock));
+                        String previousItem = mappedBlockStates.putIfAbsent(state, item.id());
+                        if (previousItem != null && !previousItem.equals(item.id()))
+                            throw new IOException("Multiple Oraxen items map to Java block state "
+                                    + state + "; the generated block mapping would be ambiguous");
+                        if (previousItem != null) {
+                            warnings.add("Block '" + item.id() + "' has multiple Java models for "
+                                    + state + "; the first model was used");
+                            continue;
+                        }
                         JsonObject override = template.deepCopy();
                         if (variant.xRotation() != 0 || variant.yRotation() != 0) {
                             JsonObject transformation = new JsonObject();
@@ -303,24 +321,29 @@ public final class PackConverter {
             }
             for (Map.Entry<String, Path> stateFile : stateFiles.entrySet()) {
                 Path path = stateFile.getValue();
-                int separator = stateFile.getKey().indexOf(':');
-                String namespace = stateFile.getKey().substring(0, separator);
-                String relative = stateFile.getKey().substring(separator + 1)
-                        .replaceFirst("\\.json$", "");
-                String base = namespace + ":" + relative;
-                JsonObject root = JsonSupport.readObject(path);
-                JsonObject variants = root.getAsJsonObject("variants");
-                if (variants != null) {
-                    variants.entrySet().forEach(entry ->
-                            addVariants(modelToState, base, namespace,
-                                    entry.getKey(), entry.getValue()));
+                try {
+                    int separator = stateFile.getKey().indexOf(':');
+                    String namespace = stateFile.getKey().substring(0, separator);
+                    String relative = stateFile.getKey().substring(separator + 1)
+                            .replaceFirst("\\.json$", "");
+                    String base = namespace + ":" + relative;
+                    JsonObject root = JsonSupport.readObject(path);
+                    JsonObject variants = root.getAsJsonObject("variants");
+                    if (variants != null) {
+                        variants.entrySet().forEach(entry ->
+                                addVariants(modelToState, base, namespace,
+                                        entry.getKey(), entry.getValue()));
+                    }
+                    JsonArray multipart = root.getAsJsonArray("multipart");
+                    if (multipart != null)
+                        readMultipart(modelToState, base, namespace, multipart);
+                } catch (IOException | RuntimeException exception) {
+                    warnings.add("Could not inspect generated blockstate " + path + ": "
+                            + exception.getMessage());
                 }
-                JsonArray multipart = root.getAsJsonArray("multipart");
-                if (multipart != null)
-                    readMultipart(modelToState, base, namespace, multipart);
             }
-        } catch (IOException | RuntimeException ex) {
-            warnings.add("Could not inspect generated blockstates: " + ex.getMessage());
+        } catch (IOException | RuntimeException exception) {
+            warnings.add("Could not scan generated blockstates: " + exception.getMessage());
         }
         return modelToState;
     }
@@ -527,9 +550,9 @@ public final class PackConverter {
     }
 
     private Path findItemTexture(PackSource source, OraxenItem item,
-                                 String resolvedModel) throws IOException {
+                                 String resolvedModel, String defaultNamespace) throws IOException {
         for (String reference : item.textures()) {
-            Path found = source.findTexture(reference);
+            Path found = source.findTexture(reference, defaultNamespace);
             if (found != null) return found;
         }
         if (resolvedModel != null) {
@@ -546,7 +569,7 @@ public final class PackConverter {
                 }
             }
         }
-        return source.findTexture(item.id());
+        return source.findTexture(item.id(), defaultNamespace);
     }
 
     private void copyMatching(PackSource source, Path bedrock, Predicate<Path> predicate,
@@ -555,21 +578,27 @@ public final class PackConverter {
             for (Path assets : source.assetRoots()) {
                 try (Stream<Path> paths = Files.walk(assets)) {
                     for (Path sourceFile : paths.filter(predicate).toList()) {
-                String normalized = sourceFile.toString().replace('\\', '/');
-                String marker = normalized.contains("/textures/gui/") ? "/textures/gui/" : "/sounds/";
-                int index = normalized.indexOf(marker);
-                if (index < 0) continue;
-                String relative = normalized.substring(index + marker.length());
-                String namespace = assetNamespace(normalized);
-                Path target = marker.contains("gui")
-                        ? bedrock.resolve("textures/ui").resolve(namespace).resolve(relative)
-                        : bedrock.resolve("sounds/oraxen").resolve(relative);
-                copy(sourceFile, target);
+                        try {
+                            String normalized = sourceFile.toString().replace('\\', '/');
+                            String marker = normalized.contains("/textures/gui/")
+                                    ? "/textures/gui/" : "/sounds/";
+                            int index = normalized.indexOf(marker);
+                            if (index < 0) continue;
+                            String relative = normalized.substring(index + marker.length());
+                            String namespace = assetNamespace(normalized);
+                            Path target = marker.contains("gui")
+                                    ? bedrock.resolve("textures/ui").resolve(namespace).resolve(relative)
+                                    : bedrock.resolve("sounds/oraxen").resolve(relative);
+                            copy(sourceFile, target);
+                        } catch (IOException exception) {
+                            warnings.add("Could not copy asset " + sourceFile + ": "
+                                    + exception.getMessage());
+                        }
                     }
                 }
             }
         } catch (IOException ex) {
-            warnings.add("Could not copy UI/sound assets: " + ex.getMessage());
+            warnings.add("Could not scan UI/sound assets: " + ex.getMessage());
         }
     }
 
@@ -750,6 +779,12 @@ public final class PackConverter {
     private static String plainText(String value) {
         if (value == null) return "";
         return value.replaceAll("<[^>]+>", "").replaceAll("§[0-9A-FK-ORa-fk-or]", "");
+    }
+
+    private static String javaIdentifier(String material) {
+        String value = material == null ? "paper"
+                : material.toLowerCase(Locale.ROOT).replace('\\', '/');
+        return value.contains(":") ? value : "minecraft:" + value;
     }
 
     private record BlockVariant(String state, int xRotation, int yRotation) {}

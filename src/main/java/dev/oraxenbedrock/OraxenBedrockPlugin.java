@@ -56,25 +56,25 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (!sender.hasPermission("oraxenbedrock.admin")) {
-            sender.sendMessage(PREFIX + ChatColor.RED + "Недостаточно прав.");
+            sender.sendMessage(PREFIX + ChatColor.RED + "You do not have permission to use this command.");
             return true;
         }
         String action = args.length == 0 ? "status" : args[0].toLowerCase(Locale.ROOT);
         switch (action) {
             case "generate", "convert" -> {
-                sender.sendMessage(PREFIX + "Конвертация запущена...");
+                sender.sendMessage(PREFIX + "Conversion started...");
                 manager.generate("command by " + sender.getName(),
                         result -> sendResult(sender, result),
-                        error -> sender.sendMessage(PREFIX + ChatColor.RED + "Ошибка: " + error));
+                        error -> sender.sendMessage(PREFIX + ChatColor.RED + "Error: " + error));
             }
             case "reload" -> {
                 reloadConfig();
                 manager.setConfig(BridgeConfig.load(this));
                 scheduleWatcher();
-                sender.sendMessage(PREFIX + ChatColor.GREEN + "Конфигурация перезагружена.");
+                sender.sendMessage(PREFIX + ChatColor.GREEN + "Configuration reloaded.");
             }
             case "status" -> sendStatus(sender);
-            default -> sender.sendMessage(PREFIX + "Использование: /" + label + " <generate|reload|status>");
+            default -> sender.sendMessage(PREFIX + "Usage: /" + label + " <generate|reload|status>");
         }
         return true;
     }
@@ -89,34 +89,34 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
 
     private void sendStatus(CommandSender sender) {
         if (manager.isRunning()) {
-            sender.sendMessage(PREFIX + ChatColor.YELLOW + "Конвертация выполняется.");
+            sender.sendMessage(PREFIX + ChatColor.YELLOW + "Conversion is in progress.");
             return;
         }
         ConversionResult result = manager.lastResult();
         if (result == null) {
             String error = manager.lastError();
             sender.sendMessage(PREFIX + (error == null
-                    ? "Пак ещё не генерировался."
-                    : ChatColor.RED + "Последняя ошибка: " + error));
+                    ? "The pack has not been generated yet."
+                    : ChatColor.RED + "Last error: " + error));
             return;
         }
         String time = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm:ss")
                 .withZone(ZoneId.systemDefault()).format(result.finishedAt());
-        sender.sendMessage(PREFIX + ChatColor.GREEN + "Последняя сборка: " + time);
-        sender.sendMessage(ChatColor.GRAY + "Предметы: " + result.items()
-                + ", блоки: " + result.blocks() + ", текстуры: " + result.textures()
-                + ", предупреждения: " + result.warnings().size());
-        sender.sendMessage(ChatColor.GRAY + "Пак: " + result.pack());
+        sender.sendMessage(PREFIX + ChatColor.GREEN + "Last build: " + time);
+        sender.sendMessage(ChatColor.GRAY + "Items: " + result.items()
+                + ", blocks: " + result.blocks() + ", textures: " + result.textures()
+                + ", warnings: " + result.warnings().size());
+        sender.sendMessage(ChatColor.GRAY + "Pack: " + result.pack());
     }
 
     private void sendResult(CommandSender sender, ConversionResult result) {
-        sender.sendMessage(PREFIX + ChatColor.GREEN + "Готово: " + result.items()
-                + " предметов, " + result.blocks() + " блоков.");
+        sender.sendMessage(PREFIX + ChatColor.GREEN + "Done: " + result.items()
+                + " items, " + result.blocks() + " blocks.");
         if (!result.warnings().isEmpty())
-            sender.sendMessage(PREFIX + ChatColor.YELLOW + "Есть предупреждения: "
-                    + result.warnings().size() + " (см. plugins/OraxenBedrock/last-report.json)");
+            sender.sendMessage(PREFIX + ChatColor.YELLOW + "Warnings: "
+                    + result.warnings().size() + " (see plugins/OraxenBedrock/last-report.json)");
         sender.sendMessage(PREFIX + ChatColor.YELLOW
-                + "После изменения Geyser mappings требуется перезапуск Geyser/сервера.");
+                + "Restart Geyser or the server after changing Geyser mappings.");
     }
 
     private void scheduleWatcher() {

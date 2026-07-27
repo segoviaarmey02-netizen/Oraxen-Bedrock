@@ -8,6 +8,8 @@ import org.bukkit.Bukkit;
 import java.io.IOException;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.Comparator;
+import java.util.stream.Stream;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
@@ -47,7 +49,7 @@ final class ConversionManager {
 
     void generate(String reason, Consumer<ConversionResult> success, Consumer<String> failure) {
         if (!running.compareAndSet(false, true)) {
-            if (failure != null) failure.accept("Конвертация уже выполняется.");
+            if (failure != null) failure.accept("A conversion is already in progress.");
             return;
         }
         BridgeConfig snapshot = config;
@@ -62,10 +64,11 @@ final class ConversionManager {
                         + result.blocks() + " blocks, " + result.warnings().size() + " warnings.");
                 if (success != null) onMain(() -> success.accept(result));
             } catch (Exception ex) {
-                lastError = ex.getMessage();
-                plugin.getLogger().severe("Bedrock conversion failed: " + ex.getMessage());
+                String message = errorMessage(ex);
+                lastError = message;
+                plugin.getLogger().severe("Bedrock conversion failed: " + message);
                 if (snapshot.verbose()) ex.printStackTrace();
-                if (failure != null) onMain(() -> failure.accept(ex.getMessage()));
+                if (failure != null) onMain(() -> failure.accept(message));
             } finally {
                 running.set(false);
             }
@@ -87,6 +90,7 @@ final class ConversionManager {
         value = fingerprintPath(current.oraxenDirectory().resolve("items"), value);
         value = fingerprintPath(current.oraxenDirectory().resolve("sound.yml"), value);
         value = fingerprintPath(current.javaPack(), value);
+        value = fingerprintPath(plugin.getDataFolder().toPath().resolve("overrides"), value);
         return value;
     }
 
@@ -97,19 +101,30 @@ final class ConversionManager {
                 BasicFileAttributes a = Files.readAttributes(root, BasicFileAttributes.class);
                 return seed * 31 + a.lastModifiedTime().toMillis() * 17 + a.size();
             }
-            final long[] hash = {seed};
-            Files.walkFileTree(root, new SimpleFileVisitor<>() {
-                @Override public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-                    hash[0] = hash[0] * 31 + root.relativize(file).toString().hashCode();
-                    hash[0] = hash[0] * 31 + attrs.lastModifiedTime().toMillis();
-                    hash[0] = hash[0] * 31 + attrs.size();
-                    return FileVisitResult.CONTINUE;
+            long hash = seed;
+            try (Stream<Path> paths = Files.walk(root)) {
+                for (Path file : paths.filter(Files::isRegularFile)
+                        .sorted(Comparator.comparing(path ->
+                                root.relativize(path).toString().replace('\\', '/')))
+                        .toList()) {
+                    BasicFileAttributes attributes =
+                            Files.readAttributes(file, BasicFileAttributes.class);
+                    hash = hash * 31
+                            + root.relativize(file).toString().replace('\\', '/').hashCode();
+                    hash = hash * 31 + attributes.lastModifiedTime().toMillis();
+                    hash = hash * 31 + attributes.size();
                 }
-            });
-            return hash[0];
+            }
+            return hash;
         } catch (IOException ex) {
             return seed * 31 + 1;
         }
+    }
+
+    private String errorMessage(Exception exception) {
+        String message = exception.getMessage();
+        return message == null || message.isBlank()
+                ? exception.getClass().getSimpleName() : message;
     }
 
     private void onMain(Runnable runnable) {

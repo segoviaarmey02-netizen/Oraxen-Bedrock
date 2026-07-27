@@ -22,35 +22,17 @@ final class LanguageConverter {
             for (Path assets : source.assetRoots()) {
                 try (Stream<Path> paths = Files.walk(assets)) {
                     for (Path file : paths.filter(Files::isRegularFile).sorted().toList()) {
-                        String normalized = file.toString().replace('\\', '/');
-                        if (!normalized.contains("/lang/")) continue;
-                        String name = file.getFileName().toString();
-                        String locale;
-                        if (name.endsWith(".json")) {
-                            locale = bedrockLocale(name.substring(0, name.length() - 5));
-                            JsonObject json = JsonSupport.readObject(file);
-                            SortedMap<String, String> values =
-                                    languages.computeIfAbsent(locale, ignored -> new TreeMap<>());
-                            for (Map.Entry<String, JsonElement> entry : json.entrySet()) {
-                                if (entry.getValue().isJsonPrimitive())
-                                    values.put(entry.getKey(), entry.getValue().getAsString());
-                            }
-                        } else if (name.endsWith(".lang")) {
-                            locale = bedrockLocale(name.substring(0, name.length() - 5));
-                            SortedMap<String, String> values =
-                                    languages.computeIfAbsent(locale, ignored -> new TreeMap<>());
-                            for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
-                                if (line.isBlank() || line.stripLeading().startsWith("#")) continue;
-                                int split = line.indexOf('=');
-                                if (split > 0)
-                                    values.put(line.substring(0, split), line.substring(split + 1));
-                            }
+                        try {
+                            readLanguageFile(file, languages);
+                        } catch (IOException | RuntimeException exception) {
+                            warnings.add("Could not convert language file " + file + ": "
+                                    + exception.getMessage());
                         }
                     }
                 }
             }
-        } catch (IOException | RuntimeException ex) {
-            warnings.add("Could not convert language files: " + ex.getMessage());
+        } catch (IOException exception) {
+            warnings.add("Could not scan language files: " + exception.getMessage());
         }
 
         int entries = 0;
@@ -77,6 +59,34 @@ final class LanguageConverter {
             warnings.add("Could not write texts/languages.json: " + ex.getMessage());
         }
         return new Result(available.size(), entries);
+    }
+
+    private void readLanguageFile(Path file,
+                                  Map<String, SortedMap<String, String>> languages)
+            throws IOException {
+        String normalized = file.toString().replace('\\', '/');
+        if (!normalized.contains("/lang/")) return;
+        String name = file.getFileName().toString();
+        if (name.endsWith(".json")) {
+            String locale = bedrockLocale(name.substring(0, name.length() - 5));
+            JsonObject json = JsonSupport.readObject(file);
+            SortedMap<String, String> values =
+                    languages.computeIfAbsent(locale, ignored -> new TreeMap<>());
+            for (Map.Entry<String, JsonElement> entry : json.entrySet()) {
+                if (entry.getValue().isJsonPrimitive())
+                    values.put(entry.getKey(), entry.getValue().getAsString());
+            }
+        } else if (name.endsWith(".lang")) {
+            String locale = bedrockLocale(name.substring(0, name.length() - 5));
+            SortedMap<String, String> values =
+                    languages.computeIfAbsent(locale, ignored -> new TreeMap<>());
+            for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+                if (line.isBlank() || line.stripLeading().startsWith("#")) continue;
+                int split = line.indexOf('=');
+                if (split > 0)
+                    values.put(line.substring(0, split), line.substring(split + 1));
+            }
+        }
     }
 
     private String bedrockLocale(String locale) {

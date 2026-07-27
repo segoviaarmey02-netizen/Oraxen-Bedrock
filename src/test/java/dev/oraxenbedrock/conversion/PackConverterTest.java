@@ -1,5 +1,6 @@
 package dev.oraxenbedrock.conversion;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import dev.oraxenbedrock.config.BridgeConfig;
@@ -80,6 +81,7 @@ class PackConverterTest {
                     equippable:
                       slot: HEAD
                       model: oraxen:ruby
+                      allowed_entities: [minecraft:player]
                 """);
         Path javaPack = oraxen.resolve("pack/pack.zip");
         Files.createDirectories(javaPack.getParent());
@@ -179,6 +181,9 @@ class PackConverterTest {
                 .findFirst().orElseThrow();
         assertEquals("head", helmet.getAsJsonObject("components")
                 .getAsJsonObject("minecraft:equippable").get("slot").getAsString());
+        assertEquals("minecraft:player", helmet.getAsJsonObject("components")
+                .getAsJsonObject("minecraft:equippable").getAsJsonArray("allowed_entities")
+                .get(0).getAsString());
         try (FileSystem pack = FileSystems.newFileSystem(result.pack())) {
             assertTrue(Files.isRegularFile(pack.getPath("/attachables/oraxen/ruby_sword.attachable.json")));
             assertTrue(Files.isRegularFile(pack.getPath("/attachables/oraxen/ruby_helmet.attachable.json")));
@@ -433,6 +438,8 @@ class PackConverterTest {
                       "min_format":[69,0],"max_format":[84,0]}}
                     """.getBytes(StandardCharsets.UTF_8));
             entry(zip, "pack.png", png(32, 32, 0xFF8844FF));
+            entry(zip, "assets/aaa/blockstates/broken.json", "{".getBytes(StandardCharsets.UTF_8));
+            entry(zip, "assets/aaa/lang/aa_aa.json", "{".getBytes(StandardCharsets.UTF_8));
             entry(zip, "assets/oraxen/items/modern_blade.json", """
                     {"model":{"type":"minecraft:condition",
                       "property":"minecraft:using_item",
@@ -564,6 +571,79 @@ class PackConverterTest {
         assertTrue(MinecraftVersion.parse("1.21.11").supported());
         assertTrue(MinecraftVersion.parse("26.2").supported());
         assertFalse(MinecraftVersion.parse("1.20.4").supported());
+    }
+
+    @Test
+    void fixesLegacyMappingsBuiltinParentsAndAssetLookupIsolation() throws Exception {
+        Path oraxen = temp.resolve("plugins/Oraxen");
+        Files.createDirectories(oraxen.resolve("items"));
+        Files.writeString(oraxen.resolve("items/compatibility.yml"), """
+                legacy_widget:
+                  displayname: "Legacy Widget"
+                  material: custom:widget
+                  Pack:
+                    custom_model_data: 17
+                    model: item/legacy_widget
+                    textures: [shared]
+                modern_cube:
+                  displayname: "Modern Cube"
+                  material: PAPER
+                  Pack:
+                    custom_model_data: 22
+                    model: block/modern_cube
+                    textures: [modern_cube]
+                """);
+        Path javaPack = oraxen.resolve("pack/pack.zip");
+        Files.createDirectories(javaPack.getParent());
+        try (ZipOutputStream zip = new ZipOutputStream(Files.newOutputStream(javaPack))) {
+            entry(zip, "pack.mcmeta", """
+                    {"pack":{"pack_format":46,"description":"Minecraft 1.21.4"}}
+                    """.getBytes(StandardCharsets.UTF_8));
+            entry(zip, "assets/oraxen/textures/shared.png",
+                    png(16, 16, 0xFFAA5500));
+            entry(zip, "assets/oraxen/textures/modern_cube.png",
+                    png(16, 16, 0xFF55AA00));
+            entry(zip, "assets/oraxen/items/modern_cube.json", """
+                    {"model":{"type":"minecraft:model","model":"block/modern_cube"}}
+                    """.getBytes(StandardCharsets.UTF_8));
+            entry(zip, "assets/oraxen/models/block/modern_cube.json", """
+                    {"parent":"block/cube_all","textures":{"all":"oraxen:modern_cube"}}
+                    """.getBytes(StandardCharsets.UTF_8));
+        }
+
+        try (PackSource source = PackSource.open(javaPack)) {
+            assertNull(source.findTexture("custom:shared"),
+                    "Texture fallback must not leak across namespaces");
+            assertNull(source.findAsset("oraxen", "../oraxen/textures/shared.png"),
+                    "Asset references with traversal segments must be rejected");
+        }
+
+        Path geyser = temp.resolve("plugins/Geyser-Spigot");
+        Path data = temp.resolve("plugins/OraxenBedrock");
+        BridgeConfig config = new BridgeConfig(
+                temp, oraxen, geyser, javaPack, "Test", "Test pack", "oraxen",
+                new int[]{1, 3, 0}, true, false, false, false, false, false, false,
+                false, false, 100, false);
+
+        ConversionResult result = new PackConverter(data).convert(config);
+        JsonObject mappings = JsonSupport.readObject(result.mappings());
+        JsonObject legacy = mappings.getAsJsonObject("items")
+                .getAsJsonArray("custom:widget").get(0).getAsJsonObject();
+        assertEquals("legacy", legacy.get("type").getAsString());
+        assertEquals(17, legacy.get("custom_model_data").getAsInt());
+        JsonObject modern = mappings.getAsJsonObject("items")
+                .getAsJsonArray("minecraft:paper").get(0).getAsJsonObject();
+        assertEquals("definition", modern.get("type").getAsString());
+        assertEquals("oraxen:modern_cube", modern.get("model").getAsString());
+        try (FileSystem pack = FileSystems.newFileSystem(result.pack())) {
+            JsonObject geometry = JsonSupport.readObject(
+                    pack.getPath("/models/oraxen/modern_cube.geo.json"));
+            JsonArray cubes = geometry.getAsJsonArray("minecraft:geometry").get(0)
+                    .getAsJsonObject().getAsJsonArray("bones").get(0)
+                    .getAsJsonObject().getAsJsonArray("cubes");
+            assertEquals(1, cubes.size(),
+                    "An unqualified block/cube_all parent must resolve to the Minecraft builtin");
+        }
     }
 
     private static byte[] cubeModel(String texture) {
