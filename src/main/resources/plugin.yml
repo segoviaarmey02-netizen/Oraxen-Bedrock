@@ -1,0 +1,19 @@
+name: OraxenBedrock
+version: '2.4.0'
+main: dev.oraxenbedrock.OraxenBedrockPlugin
+api-version: '1.21.11'
+load: POSTWORLD
+depend: [Oraxen]
+softdepend: [Geyser-Spigot]
+authors: [djx3ui]
+description: Automatically builds and installs a Bedrock pack and Geyser mappings from Oraxen.
+commands:
+  oraxenbedrock:
+    description: Manage Oraxen to Geyser conversion
+    usage: /oraxenbedrock <generate|reload|status>
+    aliases: [ob, obridge]
+    permission: oraxenbedrock.admin
+permissions:
+  oraxenbedrock.admin:
+    description: Allows managing OraxenBedrock
+    default: op

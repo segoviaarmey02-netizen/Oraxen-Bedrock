@@ -1,0 +1,35 @@
+# OraxenBedrock 2.4
+auto-generate:
+  on-startup: true
+  watch-files: true
+  debounce-seconds: 5
+
+paths:
+  # Relative paths are resolved against the server directory.
+  oraxen-directory: plugins/Oraxen
+  # Leave blank to auto-detect Geyser-Spigot, Geyser-Fabric or Geyser-Standalone.
+  geyser-directory: ""
+  # Oraxen writes its generated Java pack here by default.
+  java-pack: plugins/Oraxen/pack/pack.zip
+
+pack:
+  name: Oraxen Bedrock
+  description: Automatically converted Oraxen resources
+  namespace: oraxen
+  # Bump this if clients keep a stale Bedrock pack in cache.
+  version: [1, 0, 0]
+
+conversion:
+  items: true
+  blocks: true
+  # Generates Bedrock font/glyph_XX.png pages from Java bitmap font providers.
+  glyphs-and-emojis: true
+  # Converts assets/*/lang JSON files into Bedrock texts/*.lang files.
+  localizations: true
+  copy-sounds: true
+  copy-ui-textures: true
+  # Existing Bedrock files from plugins/OraxenBedrock/overrides/ are merged last.
+  apply-overrides: true
+
+logging:
+  verbose: false
