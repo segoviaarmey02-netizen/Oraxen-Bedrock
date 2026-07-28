@@ -11,21 +11,32 @@ public record OraxenItem(
         String itemModel,
         Integer customModelData,
         boolean excludeFromItemModel,
+        boolean excludeFromInventory,
         List<String> textures,
         String parentModel,
+        Map<String, String> packModels,
         Map<String, Object> components,
-    Map<String, Object> mechanics
+        Map<String, Object> mechanics
 ) {
     public boolean isBlock() {
         return hasMechanic("noteblock")
                 || hasMechanic("stringblock")
                 || hasMechanic("chorusblock")
                 || hasMechanic("shapedblock")
+                || hasMechanic("shaped_block")
                 || hasMechanic("block");
     }
 
     public boolean isFurniture() {
         return hasMechanic("furniture");
+    }
+
+    public boolean isHat() {
+        return hasMechanic("hat");
+    }
+
+    public boolean isCosmeticBackpack() {
+        return hasMechanic("backpack_cosmetic");
     }
 
     private boolean hasMechanic(String name) {

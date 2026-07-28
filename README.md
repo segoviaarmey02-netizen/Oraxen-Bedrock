@@ -28,10 +28,38 @@ discovered across every namespace in Oraxen's generated
 
 Modern Java 1.21.4+ item definitions from `assets/*/items/*.json` are resolved,
 including model, composite, condition, select and range-dispatch nodes.
-Conditional Java predicates have no direct Geyser mapping equivalent, so the
-converter chooses their first concrete model and records that approximation in
-the report. Both modern definitions and traditional `models/item` assets can
-therefore drive Bedrock geometry and icons.
+Their alternate visual states become additional Geyser mappings instead of
+being discarded. Supported conditions include broken, damaged, custom model
+data, component presence and the fishing-rod cast state; supported selectors
+include crossbow charge type, armor-trim material, context dimension and custom
+model data; supported ranges include bundle fullness, damage, stack count and
+custom model data. Unsupported predicate types still use their explicit
+fallback/normal branch and are identified in the conversion report. Both
+modern definitions and traditional `models/item` assets can therefore drive
+Bedrock geometry, icons and state-dependent variants.
+
+Current Oraxen `Pack.models` entries are converted into independent Geyser
+definitions too. Furniture jukebox states, inline plant stages and other named
+models such as `oraxen:item_id/active` therefore retain their own icon,
+geometry and attachable. `Pack.gui_model` display-context branches are used for
+the Bedrock inventory icon while the normal fallback model remains the held
+3D model, which preserves the intended split for custom swords and tools.
+Oraxen's `model_data_ids` appearance mode is discovered inside the vanilla
+material item definition and emitted with the matching Geyser
+`custom_model_data` string predicate. The numeric `model_data_float` mode is
+also discovered from its generated material definition even when the assigned
+CMD value was not written into the source item YAML. With FULL resource-key
+obfuscation, the converter can recover the renamed model by comparing its
+decoded generated textures with the original files under Oraxen's `pack`
+directory. If several numeric entries use the same source texture, conversion
+reports the ambiguity and refuses to guess a CMD threshold.
+
+Oraxen 1.212+ stackable StringBlocks are mapped by their declared
+`custom_variation` values, including every `stackable` level. This keeps all
+stack geometries correct even when Oraxen's SIMPLE/FULL resource-key
+obfuscation replaces the configured model paths in the generated blockstate.
+The effective modern item model is likewise used to locate obfuscated
+NoteBlock and other generated block models.
 
 Resource-pack metadata is version-aware across the full supported range:
 
@@ -59,9 +87,12 @@ Animated Java textures with a sibling `texture.png.mcmeta` are converted too:
 
 - block and block-backed decoration textures are registered in Bedrock
   `textures/flipbook_textures.json`;
-- animated swords, tools, hats, flat items and single-texture 3D furniture are
+- animated swords, tools, hats, flat items and 3D furniture are
   split into individual frames and receive a generated attachable render
   controller;
+- models with several materials are packed into a power-of-two Bedrock atlas;
+  independently animated materials are synchronized on a shared timeline and
+  rendered without dropping static or animated layers;
 - Java frame order and per-frame timing are preserved, including frame objects
   with their own `time`;
 - horizontal or grid-based Java frame sheets are repacked into the vertical
@@ -75,14 +106,30 @@ inventory icon uses frame zero while the held/equipped 2D or 3D model animates.
 
 Standard Java 3D JSON models are converted automatically: inherited parents,
 elements, per-face UV, element rotations, texture aliases, multiple materials,
-and the common `cube_all`, `cube_column`, `orientable`, and `cross` parents.
+texture-size-aware UV scaling, and the common `cube_all`, `cube_column`,
+`orientable`, `cross`, leaves and trapdoor template parents. Java
+first-person, third-person and head `display` transforms are translated into
+Bedrock attachable animations, preserving item rotation, translation and scale
+while held or equipped.
+
+Oraxen shaped blocks are resolved per Java block state rather than flattened to
+one model. Stairs retain straight, inner and outer corner geometry; doors retain
+separate upper/lower and open/closed variants; rotations and other declared
+variant transforms produce distinct Bedrock block mappings and geometries.
 
 Equipment is pre-converted as well:
 
 - swords, axes, pickaxes, bows, crossbows, tridents, maces, shields and tools
   receive handheld options and 3D Bedrock attachables;
+- custom weapons based on neutral materials such as `PAPER` are recognized
+  from their resolved `item/handheld` parent (or weapon-shaped item/component
+  metadata), while an explicitly configured stack size is preserved;
 - component-based helmets, chestplates, leggings and boots receive
   `equippable` mappings, armor geometry and the correct Oraxen armor layer;
+- modern Java equipment assets from `assets/*/equipment/*.json` are supported,
+  including `humanoid`, `humanoid_leggings` and `wings` layer selection and
+  layered texture composition, while legacy `_armor_layer_1` and
+  `_armor_layer_2` packs remain compatible;
 - elytra receive their texture, vanilla wing geometry and gliding animation;
 - component-based 3D hats receive a head-bound attachable generated from their
   Java model;
@@ -94,8 +141,10 @@ Equipment is pre-converted as well:
 Supported Geyser v2 Java components (`equippable`, `food`, `consumable`,
 durability, stack size, cooldown, enchantable, tool and repair data,
 `attack_range`, kinetic/piercing weapons, swing animation and use effects) are
-copied to item mappings. Oraxen's advanced durability object is normalized to
-the numeric maximum damage expected by Geyser.
+copied to item mappings. Oraxen's advanced durability object, friendly
+tool-rule fields (`material`, `materials`, `tag`, `tags`), consumable effects,
+sound identifiers, cooldown groups and repair holder sets are normalized to
+the vanilla component structures expected by Geyser.
 
 Block light emission, light dampening, hardness and friction are carried into
 custom block state overrides. Mechanic names are matched case-insensitively,
@@ -130,10 +179,12 @@ Requires JDK 21+ and Maven:
 mvn clean package
 ```
 
-Install `target/OraxenBedrock-2.5.0.jar` alongside Oraxen and Geyser, set
+Install `target/OraxenBedrock-2.6.5.jar` alongside Oraxen and Geyser, set
 `gameplay.enable-custom-content: true` in Geyser, then restart the server.
 The declared plugin initialization order is Oraxen, OraxenBedrock, then
-Geyser-Spigot.
+Geyser-Spigot. When Oraxen's Java pack already exists, the initial conversion
+is completed before Geyser-Spigot enables so it can discover the mappings on
+the same server start.
 
 Commands:
 

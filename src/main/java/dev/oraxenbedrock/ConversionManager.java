@@ -54,25 +54,15 @@ final class ConversionManager {
         }
         BridgeConfig snapshot = config;
         plugin.getLogger().info("Starting Bedrock pack generation (" + reason + ")...");
-        Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
-            try {
-                ConversionResult result = new PackConverter(plugin.getDataFolder().toPath()).convert(snapshot);
-                lastResult = result;
-                lastError = null;
-                fingerprint = calculateFingerprint(snapshot);
-                plugin.getLogger().info("Bedrock pack ready: " + result.items() + " items, "
-                        + result.blocks() + " blocks, " + result.warnings().size() + " warnings.");
-                if (success != null) onMain(() -> success.accept(result));
-            } catch (Exception ex) {
-                String message = errorMessage(ex);
-                lastError = message;
-                plugin.getLogger().severe("Bedrock conversion failed: " + message);
-                if (snapshot.verbose()) ex.printStackTrace();
-                if (failure != null) onMain(() -> failure.accept(message));
-            } finally {
-                running.set(false);
-            }
-        });
+        Bukkit.getScheduler().runTaskAsynchronously(plugin,
+                () -> runGeneration(snapshot, success, failure, true));
+    }
+
+    void generateNow(String reason) {
+        if (!running.compareAndSet(false, true)) return;
+        BridgeConfig snapshot = config;
+        plugin.getLogger().info("Starting Bedrock pack generation (" + reason + ")...");
+        runGeneration(snapshot, null, null, false);
     }
 
     void pollForChanges() {
@@ -129,5 +119,34 @@ final class ConversionManager {
 
     private void onMain(Runnable runnable) {
         Bukkit.getScheduler().runTask(plugin, runnable);
+    }
+
+    private void runGeneration(BridgeConfig snapshot,
+                               Consumer<ConversionResult> success,
+                               Consumer<String> failure,
+                               boolean dispatchCallbacks) {
+        try {
+            ConversionResult result =
+                    new PackConverter(plugin.getDataFolder().toPath()).convert(snapshot);
+            lastResult = result;
+            lastError = null;
+            fingerprint = calculateFingerprint(snapshot);
+            plugin.getLogger().info("Bedrock pack ready: " + result.items() + " items, "
+                    + result.blocks() + " blocks, " + result.warnings().size() + " warnings.");
+            if (success != null) dispatch(success, result, dispatchCallbacks);
+        } catch (Exception exception) {
+            String message = errorMessage(exception);
+            lastError = message;
+            plugin.getLogger().severe("Bedrock conversion failed: " + message);
+            if (snapshot.verbose()) exception.printStackTrace();
+            if (failure != null) dispatch(failure, message, dispatchCallbacks);
+        } finally {
+            running.set(false);
+        }
+    }
+
+    private <T> void dispatch(Consumer<T> consumer, T value, boolean onMainThread) {
+        if (onMainThread) onMain(() -> consumer.accept(value));
+        else consumer.accept(value);
     }
 }

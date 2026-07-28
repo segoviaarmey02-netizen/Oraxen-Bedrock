@@ -5,6 +5,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Locale;
 
 public record BridgeConfig(
         Path serverRoot,
@@ -67,7 +68,7 @@ public record BridgeConfig(
     private static Path detectGeyser(Path root) {
         for (String candidate : List.of(
                 "plugins/Geyser-Spigot", "plugins/Geyser-Paper", "plugins/Geyser",
-                "config/Geyser-Spigot", "config/Geyser-Fabric")) {
+                "config/Geyser-Spigot")) {
             Path path = root.resolve(candidate);
             if (path.toFile().isDirectory()) return path.normalize();
         }
@@ -75,7 +76,7 @@ public record BridgeConfig(
     }
 
     private static String sanitizeNamespace(String value) {
-        String clean = value.toLowerCase().replaceAll("[^a-z0-9_.-]", "_");
+        String clean = value.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9_.-]", "_");
         return clean.isBlank() || clean.equals("minecraft") ? "oraxen" : clean;
     }
 }

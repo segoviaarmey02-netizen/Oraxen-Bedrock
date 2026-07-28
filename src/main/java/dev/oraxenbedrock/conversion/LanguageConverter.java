@@ -9,7 +9,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
-import java.util.stream.Stream;
 
 /** Converts Java language JSON files into Bedrock .lang files. */
 final class LanguageConverter {
@@ -19,16 +18,13 @@ final class LanguageConverter {
         Map<String, SortedMap<String, String>> languages = new TreeMap<>();
         if (source.assetRoots().isEmpty()) return new Result(0, 0);
         try {
-            for (Path assets : source.assetRoots()) {
-                try (Stream<Path> paths = Files.walk(assets)) {
-                    for (Path file : paths.filter(Files::isRegularFile).sorted().toList()) {
-                        try {
-                            readLanguageFile(file, languages);
-                        } catch (IOException | RuntimeException exception) {
-                            warnings.add("Could not convert language file " + file + ": "
-                                    + exception.getMessage());
-                        }
-                    }
+            for (PackSource.AssetFile asset : source.effectiveAssetFiles()) {
+                if (!asset.relative().startsWith("lang/")) continue;
+                try {
+                    readLanguageFile(asset.relative(), asset.path(), languages);
+                } catch (IOException | RuntimeException exception) {
+                    warnings.add("Could not convert language file " + asset.path() + ": "
+                            + exception.getMessage());
                 }
             }
         } catch (IOException exception) {
@@ -61,11 +57,11 @@ final class LanguageConverter {
         return new Result(available.size(), entries);
     }
 
-    private void readLanguageFile(Path file,
+    private void readLanguageFile(String relative, Path file,
                                   Map<String, SortedMap<String, String>> languages)
             throws IOException {
-        String normalized = file.toString().replace('\\', '/');
-        if (!normalized.contains("/lang/")) return;
+        String normalized = relative.replace('\\', '/');
+        if (!normalized.startsWith("lang/")) return;
         String name = file.getFileName().toString();
         if (name.endsWith(".json")) {
             String locale = bedrockLocale(name.substring(0, name.length() - 5));

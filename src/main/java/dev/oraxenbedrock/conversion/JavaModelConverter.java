@@ -18,21 +18,26 @@ import java.util.*;
  */
 final class JavaModelConverter {
     record Material(String name, String textureReference, Path source, int width, int height) {}
-    record ConvertedModel(String identifier, JsonObject geometry, Map<String, Material> materials,
-                          boolean generatedSprite, List<String> warnings) {}
+    record ConvertedModel(String identifier, JsonObject geometry,
+                          Map<String, Material> materials, JsonObject display,
+                          boolean generatedSprite, boolean handheld,
+                          List<String> warnings) {}
 
     private static final Set<String> BUILTIN_PARENTS = Set.of(
             "minecraft:item/generated", "minecraft:item/handheld",
             "minecraft:item/handheld_rod", "minecraft:builtin/entity");
     private final PackSource pack;
-    private final String namespace;
+    private final String sourceNamespace;
+    private final String outputNamespace;
 
-    JavaModelConverter(PackSource pack, String namespace) {
+    JavaModelConverter(PackSource pack, String sourceNamespace, String outputNamespace) {
         this.pack = pack;
-        this.namespace = namespace;
+        this.sourceNamespace = sourceNamespace;
+        this.outputNamespace = outputNamespace;
     }
 
-    ConvertedModel convert(String requestedModel, String itemId) throws IOException {
+    ConvertedModel convert(String requestedModel, String itemId,
+                           boolean forceGeneratedSprite) throws IOException {
         String model = requestedModel == null || requestedModel.isBlank()
                 ? findGeneratedModel(itemId) : normalize(requestedModel);
         if (model != null && !Files.isRegularFile(modelPath(model))) {
@@ -49,12 +54,24 @@ final class JavaModelConverter {
                 ? new JsonArray() : resolved.elements.deepCopy();
         boolean generatedSprite = modelElements.isEmpty();
         if (generatedSprite) {
-            Optional<String> animatedMaterial = materials.entrySet().stream()
-                    .filter(entry -> hasAnimation(entry.getValue().source()))
-                    .map(Map.Entry::getKey).findFirst();
-            if (animatedMaterial.isEmpty())
-                return new ConvertedModel(geometryId(itemId), null, materials, true, warnings);
-            modelElements.add(spriteElement(animatedMaterial.get()));
+            List<String> spriteMaterials;
+            if (forceGeneratedSprite) {
+                spriteMaterials = materials.keySet().stream()
+                        .sorted(Comparator.comparingInt(this::layerIndex)
+                                .thenComparing(Comparator.naturalOrder()))
+                        .toList();
+            } else {
+                spriteMaterials = materials.entrySet().stream()
+                        .filter(entry -> hasAnimation(entry.getValue().source()))
+                        .map(Map.Entry::getKey).limit(1).toList();
+            }
+            if (spriteMaterials.isEmpty())
+                return new ConvertedModel(geometryId(itemId), null, materials,
+                        resolved.display.deepCopy(), true,
+                        resolved.handheld, warnings);
+            for (int index = 0; index < spriteMaterials.size(); index++)
+                modelElements.add(spriteElement(
+                        spriteMaterials.get(index), index, spriteMaterials.size()));
         }
 
         int textureWidth = materials.values().stream().mapToInt(Material::width).max().orElse(16);
@@ -77,10 +94,16 @@ final class JavaModelConverter {
             if (element.has("rotation") && element.get("rotation").isJsonObject())
                 addRotation(cube, element.getAsJsonObject("rotation"), warnings);
             JsonObject faces = element.getAsJsonObject("faces");
-            if (faces != null) cube.add("uv", convertFaces(faces, resolved.textures, from, to));
+            if (faces != null)
+                cube.add("uv", convertFaces(
+                        faces, resolved.textures, materials, from, to,
+                        textureWidth, textureHeight));
             cubes.add(cube);
         }
-        if (cubes.isEmpty()) return new ConvertedModel(geometryId(itemId), null, materials, true, warnings);
+        if (cubes.isEmpty())
+            return new ConvertedModel(geometryId(itemId), null, materials,
+                    resolved.display.deepCopy(), true,
+                    resolved.handheld, warnings);
 
         JsonObject description = new JsonObject();
         description.addProperty("identifier", geometryId(itemId));
@@ -104,7 +127,8 @@ final class JavaModelConverter {
         geometry.addProperty("format_version", "1.12.0");
         geometry.add("minecraft:geometry", definitions);
         return new ConvertedModel(geometryId(itemId), geometry, materials,
-                generatedSprite, warnings);
+                resolved.display.deepCopy(),
+                generatedSprite, resolved.handheld, warnings);
     }
 
     private Resolved resolve(String model, Set<String> chain, List<String> warnings) throws IOException {
@@ -119,7 +143,8 @@ final class JavaModelConverter {
             if (builtin != null) return builtin;
             if (!BUILTIN_PARENTS.contains(model))
                 warnings.add("Java model not found: " + model);
-            return new Resolved(new LinkedHashMap<>(), new JsonArray());
+            return new Resolved(new LinkedHashMap<>(), new JsonArray(),
+                    new JsonObject(), false);
         }
         JsonObject json = JsonSupport.readObject(path);
         Resolved parent = null;
@@ -136,17 +161,27 @@ final class JavaModelConverter {
         });
         JsonArray elements = json.has("elements") ? json.getAsJsonArray("elements")
                 : parent == null ? new JsonArray() : parent.elements.deepCopy();
+        JsonObject display = parent == null
+                ? new JsonObject() : parent.display.deepCopy();
+        JsonObject ownDisplay = json.getAsJsonObject("display");
+        if (ownDisplay != null)
+            ownDisplay.entrySet().forEach(entry ->
+                    display.add(entry.getKey(), entry.getValue().deepCopy()));
         chain.remove(model);
-        return new Resolved(textures, elements);
+        return new Resolved(textures, elements, display,
+                parent != null && parent.handheld);
     }
 
     private Map<String, Material> resolveMaterials(Map<String, String> textures,
                                                     List<String> warnings) throws IOException {
         Map<String, Material> result = new LinkedHashMap<>();
+        Set<String> materialNames = new HashSet<>();
         for (String key : textures.keySet()) {
             String reference = resolveAlias(key, textures, new HashSet<>());
             if (reference == null || reference.startsWith("#")) continue;
-            Path texture = pack.findTexture(reference);
+            // Unqualified texture references inside Oraxen models are relative
+            // to the Oraxen asset namespace, not to minecraft.
+            Path texture = pack.findTexture(reference, sourceNamespace);
             if (texture == null) {
                 warnings.add("Texture not found: " + reference);
                 continue;
@@ -154,22 +189,35 @@ final class JavaModelConverter {
             int width = 16, height = 16;
             try (InputStream input = Files.newInputStream(texture)) {
                 BufferedImage image = ImageIO.read(input);
-                if (image != null) {
-                    width = image.getWidth();
-                    height = image.getHeight();
-                    int[] frameSize = animationFrameSize(texture, width, height);
-                    width = frameSize[0];
-                    height = frameSize[1];
+                if (image == null) {
+                    warnings.add("Texture is not a readable PNG: " + reference);
+                    continue;
                 }
+                width = image.getWidth();
+                height = image.getHeight();
+                int[] frameSize = animationFrameSize(texture, width, height);
+                width = frameSize[0];
+                height = frameSize[1];
             }
-            result.put(key, new Material(materialName(key), reference, texture, width, height));
+            String baseName = materialName(key);
+            String name = baseName;
+            int suffix = 2;
+            while (!materialNames.add(name)) name = baseName + "_" + suffix++;
+            if (!name.equals(baseName))
+                warnings.add("Material name collision for texture key '" + key
+                        + "'; renamed to " + name);
+            result.put(key, new Material(name, reference, texture, width, height));
         }
         return result;
     }
 
     private JsonObject convertFaces(JsonObject faces, Map<String, String> textures,
-                                    JsonArray from, JsonArray to) {
+                                    Map<String, Material> materials,
+                                    JsonArray from, JsonArray to,
+                                    int textureWidth, int textureHeight) {
         JsonObject result = new JsonObject();
+        double scaleX = textureWidth / 16.0;
+        double scaleY = textureHeight / 16.0;
         for (Map.Entry<String, JsonElement> entry : faces.entrySet()) {
             if (!entry.getValue().isJsonObject()) continue;
             JsonObject javaFace = entry.getValue().getAsJsonObject();
@@ -178,10 +226,14 @@ final class JavaModelConverter {
             JsonArray uv = javaFace.getAsJsonArray("uv");
             if (!validUv(uv)) uv = defaultUv(entry.getKey(), from, to);
             JsonObject bedrockFace = new JsonObject();
-            bedrockFace.add("uv", vector(number(uv, 0), number(uv, 1)));
-            bedrockFace.add("uv_size", vector(number(uv, 2) - number(uv, 0),
-                    number(uv, 3) - number(uv, 1)));
-            bedrockFace.addProperty("material_instance", materialName(key));
+            bedrockFace.add("uv", vector(
+                    number(uv, 0) * scaleX, number(uv, 1) * scaleY));
+            bedrockFace.add("uv_size", vector(
+                    (number(uv, 2) - number(uv, 0)) * scaleX,
+                    (number(uv, 3) - number(uv, 1)) * scaleY));
+            Material material = materials.get(key);
+            bedrockFace.addProperty("material_instance",
+                    material == null ? materialName(key) : material.name());
             if (javaFace.has("rotation"))
                 bedrockFace.addProperty("uv_rotation", javaFace.get("rotation").getAsInt());
             result.add(mapFace(entry.getKey()), bedrockFace);
@@ -204,7 +256,37 @@ final class JavaModelConverter {
         }
         cube.add("rotation", vector(x, y, z));
         if (rotation.has("rescale") && rotation.get("rescale").getAsBoolean())
-            warnings.add("Java rescale rotation approximated by Bedrock geometry");
+            rescaleCube(cube, axis, angle, warnings);
+    }
+
+    private void rescaleCube(
+            JsonObject cube, String axis, double angle,
+            List<String> warnings) {
+        double cosine = Math.cos(Math.toRadians(Math.abs(angle)));
+        if (cosine < 1.0e-6) {
+            warnings.add("Java model rescale could not be represented for "
+                    + angle + " degree rotation");
+            return;
+        }
+        double factor = 1.0 / cosine;
+        JsonArray origin = cube.getAsJsonArray("origin");
+        JsonArray size = cube.getAsJsonArray("size");
+        JsonArray pivot = cube.getAsJsonArray("pivot");
+        if (!validVector(origin) || !validVector(size) || !validVector(pivot)) return;
+        for (int index = 0; index < 3; index++) {
+            boolean rotationAxis = switch (axis) {
+                case "x" -> index == 0;
+                case "y" -> index == 1;
+                case "z" -> index == 2;
+                default -> true;
+            };
+            if (rotationAxis) continue;
+            double oldOrigin = number(origin, index);
+            double center = number(pivot, index);
+            origin.set(index, new JsonPrimitive(
+                    center + (oldOrigin - center) * factor));
+            size.set(index, new JsonPrimitive(number(size, index) * factor));
+        }
     }
 
     private JsonArray defaultUv(String face, JsonArray from, JsonArray to) {
@@ -222,8 +304,8 @@ final class JavaModelConverter {
     }
 
     private String findGeneratedModel(String id) {
-        for (String candidate : List.of(namespace + ":item/" + id, namespace + ":block/" + id,
-                namespace + ":" + id)) {
+        for (String candidate : List.of(sourceNamespace + ":item/" + id,
+                sourceNamespace + ":block/" + id, sourceNamespace + ":" + id)) {
             if (Files.isRegularFile(modelPath(candidate))) return candidate;
         }
         return null;
@@ -233,9 +315,19 @@ final class JavaModelConverter {
         String path = model.substring(model.indexOf(':') + 1);
         JsonArray elements = new JsonArray();
         switch (path) {
-            case "block/cube_all" -> elements.add(cube(Map.of(
+            case "item/generated", "item/handheld", "item/handheld_rod",
+                 "builtin/entity" -> {
+                // These parents define item rendering semantics rather than
+                // cube geometry. Their textures and display transforms are
+                // supplied by the child model.
+            }
+            case "block/cube_all", "block/cube_mirrored_all", "block/leaves" ->
+                    elements.add(cube(Map.of(
                     "down", "#all", "up", "#all", "north", "#all",
                     "south", "#all", "west", "#all", "east", "#all")));
+            case "block/cube" -> elements.add(cube(Map.of(
+                    "down", "#down", "up", "#up", "north", "#north",
+                    "south", "#south", "west", "#west", "east", "#east")));
             case "block/cube_column", "block/cube_column_horizontal" -> elements.add(cube(Map.of(
                     "down", "#end", "up", "#end", "north", "#side",
                     "south", "#side", "west", "#side", "east", "#side")));
@@ -252,17 +344,56 @@ final class JavaModelConverter {
                 elements.add(crossElement(45));
                 elements.add(crossElement(-45));
             }
+            case "block/slab" -> elements.add(box(0, 0, 0, 16, 8, 16,
+                    topBottomSide()));
+            case "block/slab_top" -> elements.add(box(0, 8, 0, 16, 16, 16,
+                    topBottomSide()));
+            case "block/stairs" -> {
+                elements.add(box(0, 0, 0, 16, 8, 16, topBottomSide()));
+                elements.add(box(0, 8, 8, 16, 16, 16, topBottomSide()));
+            }
+            case "block/inner_stairs" -> {
+                elements.add(box(0, 0, 0, 16, 8, 16, topBottomSide()));
+                elements.add(box(0, 8, 8, 16, 16, 16, topBottomSide()));
+                elements.add(box(0, 8, 0, 8, 16, 8, topBottomSide()));
+            }
+            case "block/outer_stairs" -> {
+                elements.add(box(0, 0, 0, 16, 8, 16, topBottomSide()));
+                elements.add(box(0, 8, 8, 8, 16, 16, topBottomSide()));
+            }
+            case "block/trapdoor_bottom", "block/template_trapdoor_bottom",
+                 "block/template_orientable_trapdoor_bottom" -> elements.add(box(
+                    0, 0, 0, 16, 3, 16, allFaces("#texture")));
+            case "block/trapdoor_top", "block/template_trapdoor_top",
+                 "block/template_orientable_trapdoor_top" -> elements.add(box(
+                    0, 13, 0, 16, 16, 16, allFaces("#texture")));
+            case "block/trapdoor_open", "block/template_trapdoor_open",
+                 "block/template_orientable_trapdoor_open" -> elements.add(box(
+                    0, 0, 13, 16, 16, 16, allFaces("#texture")));
+            case "block/door_bottom_left", "block/door_bottom_right" ->
+                    elements.add(box(0, 0, 13, 16, 16, 16, allFaces("#bottom")));
+            case "block/door_top_left", "block/door_top_right" ->
+                    elements.add(box(0, 0, 13, 16, 16, 16, allFaces("#top")));
             default -> {
                 return null;
             }
         }
-        return new Resolved(new LinkedHashMap<>(), elements);
+        boolean handheld = path.equals("item/handheld")
+                || path.equals("item/handheld_rod");
+        return new Resolved(new LinkedHashMap<>(), elements,
+                new JsonObject(), handheld);
     }
 
     private JsonObject cube(Map<String, String> textures) {
+        return box(0, 0, 0, 16, 16, 16, textures);
+    }
+
+    private JsonObject box(double fromX, double fromY, double fromZ,
+                           double toX, double toY, double toZ,
+                           Map<String, String> textures) {
         JsonObject element = new JsonObject();
-        element.add("from", vector(0, 0, 0));
-        element.add("to", vector(16, 16, 16));
+        element.add("from", vector(fromX, fromY, fromZ));
+        element.add("to", vector(toX, toY, toZ));
         JsonObject faces = new JsonObject();
         textures.forEach((face, texture) -> {
             JsonObject data = new JsonObject();
@@ -271,6 +402,16 @@ final class JavaModelConverter {
         });
         element.add("faces", faces);
         return element;
+    }
+
+    private Map<String, String> topBottomSide() {
+        return Map.of("down", "#bottom", "up", "#top", "north", "#side",
+                "south", "#side", "west", "#side", "east", "#side");
+    }
+
+    private Map<String, String> allFaces(String texture) {
+        return Map.of("down", texture, "up", texture, "north", texture,
+                "south", texture, "west", texture, "east", texture);
     }
 
     private JsonObject crossElement(double angle) {
@@ -293,10 +434,13 @@ final class JavaModelConverter {
         return element;
     }
 
-    private JsonObject spriteElement(String texture) {
+    private JsonObject spriteElement(String texture, int layer, int layerCount) {
+        double depth = Math.min(0.45, Math.max(0, layerCount - 1) * 0.02);
+        double z = 8.0 - depth / 2 + (layerCount <= 1
+                ? 0 : (double) layer * depth / (layerCount - 1));
         JsonObject element = new JsonObject();
-        element.add("from", vector(0, 0, 7.5));
-        element.add("to", vector(16, 16, 8.5));
+        element.add("from", vector(0, 0, z - 0.01));
+        element.add("to", vector(16, 16, z + 0.01));
         JsonObject faces = new JsonObject();
         for (String face : List.of("north", "south")) {
             JsonObject data = new JsonObject();
@@ -306,6 +450,17 @@ final class JavaModelConverter {
         }
         element.add("faces", faces);
         return element;
+    }
+
+    private int layerIndex(String name) {
+        if (name != null && name.matches("layer\\d+")) {
+            try {
+                return Integer.parseInt(name.substring("layer".length()));
+            } catch (NumberFormatException ignored) {
+                return Integer.MAX_VALUE - 1;
+            }
+        }
+        return Integer.MAX_VALUE;
     }
 
     private boolean hasAnimation(Path texture) {
@@ -331,11 +486,12 @@ final class JavaModelConverter {
 
     private Path modelPath(String model) {
         int colon = model.indexOf(':');
+        if (colon <= 0 || colon == model.length() - 1)
+            return pack.root().resolve(".missing-model");
         String namespace = model.substring(0, colon);
         String relative = "models/" + model.substring(colon + 1) + ".json";
         Path found = pack.findAsset(namespace, relative);
-        return found != null ? found : pack.root().resolve("assets")
-                .resolve(namespace).resolve(relative);
+        return found != null ? found : pack.root().resolve(".missing-model");
     }
 
     private String resolveAlias(String key, Map<String, String> textures, Set<String> seen) {
@@ -351,19 +507,35 @@ final class JavaModelConverter {
     }
 
     private String normalize(String model) {
-        String value = model.replace('\\', '/').replace(".json", "")
-                .replaceFirst("^assets/", "").replaceFirst("^models/", "");
-        return value.contains(":") ? value : namespace + ":" + value;
+        return normalizeResource(model, sourceNamespace);
     }
 
     private String normalizeParent(String model) {
-        String value = model.replace('\\', '/').replace(".json", "")
-                .replaceFirst("^assets/", "").replaceFirst("^models/", "");
-        return value.contains(":") ? value : "minecraft:" + value;
+        return normalizeResource(model, "minecraft");
+    }
+
+    private String normalizeResource(String model, String fallbackNamespace) {
+        String value = model.replace('\\', '/')
+                .replaceFirst("(?i)\\.json$", "");
+        if (value.startsWith("assets/")) {
+            String asset = value.substring("assets/".length());
+            int slash = asset.indexOf('/');
+            if (slash > 0 && slash < asset.length() - 1)
+                return asset.substring(0, slash) + ":"
+                        + asset.substring(slash + 1)
+                        .replaceFirst("^models/", "");
+        }
+        int colon = value.indexOf(':');
+        if (colon >= 0)
+            return value.substring(0, colon) + ":"
+                    + value.substring(colon + 1)
+                    .replaceFirst("^models/", "");
+        return fallbackNamespace + ":"
+                + value.replaceFirst("^models/", "");
     }
 
     private String geometryId(String itemId) {
-        return "geometry." + namespace + "." + itemId.toLowerCase(Locale.ROOT)
+        return "geometry." + outputNamespace + "." + itemId.toLowerCase(Locale.ROOT)
                 .replaceAll("[^a-z0-9_.-]", "_");
     }
 
@@ -397,5 +569,6 @@ final class JavaModelConverter {
         return result;
     }
 
-    private record Resolved(Map<String, String> textures, JsonArray elements) {}
+    private record Resolved(Map<String, String> textures, JsonArray elements,
+                            JsonObject display, boolean handheld) {}
 }

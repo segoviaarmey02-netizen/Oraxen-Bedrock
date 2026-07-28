@@ -16,7 +16,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.*;
-import java.util.stream.Stream;
 
 /**
  * Converts Java sounds.json declarations into Bedrock sound definitions.
@@ -44,25 +43,23 @@ final class SoundConverter {
         JsonObject definitions = new JsonObject();
         Set<String> copied = new HashSet<>();
 
-        for (Path assets : source.assetRoots()) {
-            try (Stream<Path> paths = Files.walk(assets)) {
-                for (Path file : paths.filter(this::isSoundRegistry).sorted().toList()) {
-                    try {
-                        String namespace = file.getParent().getFileName().toString();
-                        JsonObject javaDefinitions = JsonSupport.readObject(file);
-                        for (Map.Entry<String, JsonElement> entry : javaDefinitions.entrySet()) {
-                            if (!entry.getValue().isJsonObject()) continue;
-                            String eventId = identifier(entry.getKey(), namespace);
-                            JsonObject converted = convertDefinition(eventId, namespace,
-                                    entry.getValue().getAsJsonObject(), metadata.get(eventId),
-                                    records.contains(eventId), copied, warnings);
-                            if (converted != null) definitions.add(eventId, converted);
-                        }
-                    } catch (IOException | RuntimeException ex) {
-                        warnings.add("Could not convert sound registry " + file + ": "
-                                + ex.getMessage());
-                    }
+        for (PackSource.AssetFile asset : source.effectiveAssetFiles()) {
+            if (!asset.relative().equalsIgnoreCase("sounds.json")) continue;
+            Path file = asset.path();
+            try {
+                String namespace = asset.namespace();
+                JsonObject javaDefinitions = JsonSupport.readObject(file);
+                for (Map.Entry<String, JsonElement> entry : javaDefinitions.entrySet()) {
+                    if (!entry.getValue().isJsonObject()) continue;
+                    String eventId = identifier(entry.getKey(), namespace);
+                    JsonObject converted = convertDefinition(eventId, namespace,
+                            entry.getValue().getAsJsonObject(), metadata.get(eventId),
+                            records.contains(eventId), copied, warnings);
+                    if (converted != null) definitions.add(eventId, converted);
                 }
+            } catch (IOException | RuntimeException ex) {
+                warnings.add("Could not convert sound registry " + file + ": "
+                        + ex.getMessage());
             }
         }
 
@@ -220,14 +217,6 @@ final class SoundConverter {
         return metadata == null ? "master" : metadata.category();
     }
 
-    private boolean isSoundRegistry(Path path) {
-        return Files.isRegularFile(path)
-                && path.getFileName().toString().equalsIgnoreCase("sounds.json")
-                && path.getParent() != null
-                && path.getParent().getParent() != null
-                && path.getParent().getParent().getFileName().toString().equals("assets");
-    }
-
     private static void copyNumber(JsonObject source, JsonObject target, String key) {
         if (source != null && source.has(key) && source.get(key).isJsonPrimitive())
             target.add(key, source.get(key).deepCopy());
@@ -237,7 +226,8 @@ final class SoundConverter {
         if (category == null || category.isBlank()) return "master";
         String value = category.toLowerCase(Locale.ROOT);
         return switch (value) {
-            case "records", "music", "jukebox" -> "record";
+            case "records", "jukebox" -> "record";
+            case "music" -> "music";
             case "blocks" -> "block";
             case "players" -> "player";
             default -> value;

@@ -43,8 +43,17 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
         scheduleWatcher();
         validateEnvironment();
         if (manager.config().generateOnStartup()) {
-            getServer().getScheduler().runTaskLater(this,
-                    () -> manager.generate("server startup", null, null), 40L);
+            if (manager.config().javaPack().toFile().isFile()) {
+                // This plugin is declared loadbefore Geyser-Spigot. Complete
+                // the initial installation before onEnable returns so Geyser
+                // can discover the generated mappings during its own startup.
+                manager.generateNow("server startup");
+            } else {
+                getLogger().warning("Initial conversion was delayed because the Oraxen Java pack"
+                        + " does not exist yet: " + manager.config().javaPack());
+                getServer().getScheduler().runTaskLater(this,
+                        () -> manager.generate("delayed server startup", null, null), 40L);
+            }
         }
     }
 

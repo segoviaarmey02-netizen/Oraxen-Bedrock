@@ -22,6 +22,7 @@ import java.util.Locale;
  * repeated indices at their greatest-common-divisor tick rate.
  */
 final class TextureAnimationConverter {
+    private static final int MAX_SEQUENCE_LENGTH = 4096;
     private int installedAnimations;
 
     record Animation(int frameCount, int frameWidth, int frameHeight,
@@ -137,12 +138,37 @@ final class TextureAnimationConverter {
             for (int index = 0; index < frameCount; index++)
                 timedFrames.add(new TimedFrame(index, defaultTime));
         }
-        int tick = timedFrames.stream().mapToInt(TimedFrame::time)
+        if (timedFrames.size() > MAX_SEQUENCE_LENGTH) {
+            warnings.add("Animation " + source + " contains more than "
+                    + MAX_SEQUENCE_LENGTH + " scheduled frames; extra entries were omitted");
+            timedFrames = new ArrayList<>(
+                    timedFrames.subList(0, MAX_SEQUENCE_LENGTH));
+        }
+        int baseTick = timedFrames.stream().mapToInt(TimedFrame::time)
                 .reduce(TextureAnimationConverter::gcd).orElse(defaultTime);
+        long sequenceLength = timedFrames.stream()
+                .mapToLong(frame -> frame.time() / baseTick).sum();
+        int tick = baseTick;
+        if (sequenceLength > MAX_SEQUENCE_LENGTH) {
+            long multiplier = (sequenceLength + MAX_SEQUENCE_LENGTH - 1)
+                    / MAX_SEQUENCE_LENGTH;
+            tick = (int) Math.min(Integer.MAX_VALUE, (long) tick * multiplier);
+            warnings.add("Animation frame timing for " + source
+                    + " was simplified to keep the Bedrock frame sequence below "
+                    + MAX_SEQUENCE_LENGTH + " entries");
+        }
         List<Integer> sequence = new ArrayList<>();
         for (TimedFrame frame : timedFrames)
-            for (int repeat = 0; repeat < frame.time() / tick; repeat++)
+            for (int repeat = 0;
+                 repeat < Math.max(1, Math.round((float) frame.time() / tick)); repeat++)
                 sequence.add(frame.index());
+        if (sequence.size() > MAX_SEQUENCE_LENGTH) {
+            List<Integer> sampled = new ArrayList<>(MAX_SEQUENCE_LENGTH);
+            for (int index = 0; index < MAX_SEQUENCE_LENGTH; index++)
+                sampled.add(sequence.get((int) ((long) index * sequence.size()
+                        / MAX_SEQUENCE_LENGTH)));
+            sequence = sampled;
+        }
 
         BufferedImage strip = new BufferedImage(frameWidth, frameHeight * frameCount,
                 BufferedImage.TYPE_INT_ARGB);

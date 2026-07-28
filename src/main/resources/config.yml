@@ -1,4 +1,4 @@
-# OraxenBedrock 2.5 — Minecraft Java 1.20.5+
+# OraxenBedrock 2.6.5 — Minecraft Java 1.20.5+
 auto-generate:
   on-startup: true
   watch-files: true
@@ -7,7 +7,7 @@ auto-generate:
 paths:
   # Relative paths are resolved against the server directory.
   oraxen-directory: plugins/Oraxen
-  # Leave blank to auto-detect Geyser-Spigot, Geyser-Fabric or Geyser-Standalone.
+  # Leave blank to auto-detect Bukkit/Paper Geyser installations.
   geyser-directory: ""
   # Oraxen writes its generated Java pack here by default.
   java-pack: plugins/Oraxen/pack/pack.zip
@@ -15,8 +15,11 @@ paths:
 pack:
   name: Oraxen Bedrock
   description: Automatically converted Oraxen resources
+  # Namespace used only for generated Bedrock identifiers and files.
+  # Java assets continue to resolve from Oraxen's "oraxen" namespace.
   namespace: oraxen
-  # Bump this if clients keep a stale Bedrock pack in cache.
+  # The first number is retained as the release major. The remaining numbers
+  # are regenerated every time so Bedrock always downloads a fresh pack.
   version: [1, 0, 0]
 
 conversion:

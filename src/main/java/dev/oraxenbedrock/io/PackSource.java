@@ -2,16 +2,20 @@ package dev.oraxenbedrock.io;
 
 import java.io.IOException;
 import java.nio.file.*;
-import java.util.Collections;
-import java.util.List;
-import java.util.Locale;
+import java.util.*;
 import java.util.stream.Stream;
 
 public final class PackSource implements AutoCloseable {
+    public record AssetFile(String namespace, String relative, Path path) {}
+
     private final Path root;
     private final FileSystem zipFileSystem;
     private final JavaPackMetadata metadata;
     private final List<Path> assetRoots;
+    private final Map<String, Optional<Path>> textureCache = new HashMap<>();
+    private final Map<String, Map<String, Optional<Path>>> basenameIndexes =
+            new HashMap<>();
+    private List<AssetFile> effectiveAssetFiles;
 
     private PackSource(Path root, FileSystem zipFileSystem) throws IOException {
         this.root = root;
@@ -34,7 +38,16 @@ public final class PackSource implements AutoCloseable {
         if (Files.isDirectory(configured)) return new PackSource(configured, null);
         if (Files.isRegularFile(configured)) {
             FileSystem fs = FileSystems.newFileSystem(configured, Collections.emptyMap());
-            return new PackSource(fs.getPath("/"), fs);
+            try {
+                return new PackSource(fs.getPath("/"), fs);
+            } catch (IOException | RuntimeException exception) {
+                try {
+                    fs.close();
+                } catch (IOException closeException) {
+                    exception.addSuppressed(closeException);
+                }
+                throw exception;
+            }
         }
         throw new NoSuchFileException("Java resource pack not found: " + configured);
     }
@@ -64,19 +77,69 @@ public final class PackSource implements AutoCloseable {
         return null;
     }
 
+    /**
+     * Returns the effective asset view after applying active overlays.
+     * A later overlay replaces a base file at the same namespace and path;
+     * files that exist only in the base pack remain visible.
+     */
+    public List<AssetFile> effectiveAssetFiles() throws IOException {
+        if (effectiveAssetFiles != null) return effectiveAssetFiles;
+        Map<String, AssetFile> effective = new LinkedHashMap<>();
+        for (Path assetRoot : assetRoots) {
+            if (!Files.isDirectory(assetRoot)) continue;
+            try (Stream<Path> namespaces = Files.list(assetRoot)) {
+                for (Path namespaceRoot : namespaces.filter(Files::isDirectory)
+                        .sorted().toList()) {
+                    String namespace = namespaceRoot.getFileName().toString();
+                    if (!validNamespace(namespace)) continue;
+                    try (Stream<Path> paths = Files.walk(namespaceRoot)) {
+                        for (Path file : paths.filter(Files::isRegularFile)
+                                .sorted().toList()) {
+                            String relative = namespaceRoot.relativize(file).toString()
+                                    .replace('\\', '/');
+                            effective.put(namespace + '\0' + relative,
+                                    new AssetFile(namespace, relative, file));
+                        }
+                    }
+                }
+            }
+        }
+        effectiveAssetFiles = List.copyOf(effective.values());
+        return effectiveAssetFiles;
+    }
+
     public Path findTexture(String reference) throws IOException {
         return findTexture(reference, "minecraft");
     }
 
     public Path findTexture(String reference, String defaultNamespace) throws IOException {
+        String cacheKey = String.valueOf(defaultNamespace) + '\0'
+                + String.valueOf(reference);
+        Optional<Path> cached = textureCache.get(cacheKey);
+        if (cached != null) return cached.orElse(null);
+        Path result = findTextureUncached(reference, defaultNamespace);
+        textureCache.put(cacheKey, Optional.ofNullable(result));
+        return result;
+    }
+
+    private Path findTextureUncached(String reference, String defaultNamespace)
+            throws IOException {
         if (reference == null || reference.isBlank()) return null;
         String normalized = reference.replace('\\', '/').replaceFirst("(?i)\\.png$", "");
         String namespace = defaultNamespace;
         String name = normalized;
-        int colon = normalized.indexOf(':');
-        if (colon >= 0) {
-            namespace = normalized.substring(0, colon);
-            name = normalized.substring(colon + 1);
+        if (normalized.startsWith("assets/")) {
+            String asset = normalized.substring("assets/".length());
+            int slash = asset.indexOf('/');
+            if (slash < 1 || slash == asset.length() - 1) return null;
+            namespace = asset.substring(0, slash);
+            name = asset.substring(slash + 1);
+        } else {
+            int colon = normalized.indexOf(':');
+            if (colon >= 0) {
+                namespace = normalized.substring(0, colon);
+                name = normalized.substring(colon + 1);
+            }
         }
         namespace = namespace.toLowerCase(Locale.ROOT);
         if (!validNamespace(namespace) || unsafeRelative(name)) return null;
@@ -92,19 +155,63 @@ public final class PackSource implements AutoCloseable {
             return null;
         }
         String fileName = namePath.getFileName() + ".png";
-        for (int i = assetRoots.size() - 1; i >= 0; i--) {
-            Path namespaceRoot = assetRoots.get(i).resolve(namespace).normalize();
-            if (!namespaceRoot.startsWith(assetRoots.get(i)) || !Files.isDirectory(namespaceRoot))
-                continue;
-            try (Stream<Path> paths = Files.walk(namespaceRoot)) {
-                Path found = paths.filter(Files::isRegularFile)
-                        .filter(p -> p.getFileName().toString().equalsIgnoreCase(fileName))
-                        .sorted()
-                        .findFirst().orElse(null);
-                if (found != null) return found;
-            }
+        return uniqueEffectiveBasename(namespace, fileName);
+    }
+
+    /**
+     * Finds a basename only when it identifies one effective resource.
+     * Resources at the same relative path are replaced by later overlays;
+     * different paths with the same basename remain ambiguous.
+     */
+    private Path uniqueEffectiveBasename(String namespace, String fileName)
+            throws IOException {
+        Map<String, Optional<Path>> index = basenameIndexes.get(namespace);
+        if (index == null) {
+            index = buildBasenameIndex(namespace);
+            basenameIndexes.put(namespace, index);
         }
-        return null;
+        return index.getOrDefault(
+                fileName.toLowerCase(Locale.ROOT), Optional.empty()).orElse(null);
+    }
+
+    private Map<String, Optional<Path>> buildBasenameIndex(String namespace)
+            throws IOException {
+        Map<String, List<Path>> effective = new LinkedHashMap<>();
+        for (Path assetRoot : assetRoots) {
+            Path namespaceRoot = assetRoot.resolve(namespace).normalize();
+            if (!namespaceRoot.startsWith(assetRoot) || !Files.isDirectory(namespaceRoot))
+                continue;
+
+            Map<String, List<Path>> layer = new LinkedHashMap<>();
+            try (Stream<Path> paths = Files.walk(namespaceRoot)) {
+                for (Path candidate : paths.filter(Files::isRegularFile)
+                        .filter(path -> path.getFileName().toString()
+                                .toLowerCase(Locale.ROOT).endsWith(".png"))
+                        .sorted()
+                        .toList()) {
+                    String relative = namespaceRoot.relativize(candidate).toString()
+                            .replace('\\', '/').toLowerCase(Locale.ROOT);
+                    layer.computeIfAbsent(relative, ignored -> new ArrayList<>())
+                            .add(candidate);
+                }
+            }
+            // Applying one overlay replaces the previous resource at the same
+            // logical path, including any case-colliding invalid candidates.
+            layer.forEach(effective::put);
+        }
+
+        Map<String, List<Path>> byBasename = new LinkedHashMap<>();
+        for (List<Path> candidates : effective.values()) {
+            for (Path candidate : candidates)
+                byBasename.computeIfAbsent(
+                        candidate.getFileName().toString().toLowerCase(Locale.ROOT),
+                        ignored -> new ArrayList<>()).add(candidate);
+        }
+        Map<String, Optional<Path>> result = new HashMap<>();
+        byBasename.forEach((name, candidates) -> result.put(name,
+                candidates.size() == 1
+                        ? Optional.of(candidates.get(0)) : Optional.empty()));
+        return result;
     }
 
     public Stream<Path> files() throws IOException {
