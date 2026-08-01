@@ -15,11 +15,16 @@ import java.util.function.Consumer;
 
 final class ConversionManager {
     private final OraxenBedrockPlugin plugin;
+    private final Object generationLock = new Object();
     private final AtomicBoolean running = new AtomicBoolean();
+    private boolean rerunRequested;
     private volatile BridgeConfig config;
     private volatile ConversionResult lastResult;
     private volatile String lastError;
     private volatile long fingerprint = Long.MIN_VALUE;
+    private volatile long observedFingerprint = Long.MIN_VALUE;
+    private volatile int stableFingerprintObservations;
+    private volatile String rerunReason;
 
     ConversionManager(OraxenBedrockPlugin plugin, BridgeConfig config) {
         this.plugin = plugin;
@@ -27,8 +32,19 @@ final class ConversionManager {
     }
 
     void setConfig(BridgeConfig config) {
-        this.config = config;
-        this.fingerprint = Long.MIN_VALUE;
+        synchronized (generationLock) {
+            this.config = config;
+            this.fingerprint = Long.MIN_VALUE;
+            this.observedFingerprint = Long.MIN_VALUE;
+            this.stableFingerprintObservations = 0;
+            if (running.get()) {
+                this.rerunRequested = true;
+                this.rerunReason = "configuration reloaded";
+            } else {
+                this.rerunRequested = false;
+                this.rerunReason = null;
+            }
+        }
     }
 
     BridgeConfig config() {
@@ -48,8 +64,9 @@ final class ConversionManager {
     }
 
     void generate(String reason, Consumer<ConversionResult> success, Consumer<String> failure) {
-        if (!running.compareAndSet(false, true)) {
-            if (failure != null) failure.accept("A conversion is already in progress.");
+        if (!beginGeneration(reason)) {
+            if (failure != null)
+                failure.accept("A conversion is already in progress; another pass was queued.");
             return;
         }
         BridgeConfig snapshot = config;
@@ -59,7 +76,7 @@ final class ConversionManager {
     }
 
     void generateNow(String reason) {
-        if (!running.compareAndSet(false, true)) return;
+        if (!beginGeneration(reason)) return;
         BridgeConfig snapshot = config;
         plugin.getLogger().info("Starting Bedrock pack generation (" + reason + ")...");
         runGeneration(snapshot, null, null, false);
@@ -70,16 +87,40 @@ final class ConversionManager {
         long current = calculateFingerprint(config);
         if (fingerprint == Long.MIN_VALUE) {
             fingerprint = current;
+            observedFingerprint = current;
+            stableFingerprintObservations = 0;
             return;
         }
-        if (current != fingerprint) generate("Oraxen files changed", null, null);
+        if (current == fingerprint) {
+            observedFingerprint = current;
+            stableFingerprintObservations = 0;
+            return;
+        }
+        if (current != observedFingerprint) {
+            observedFingerprint = current;
+            stableFingerprintObservations = 0;
+            return;
+        }
+        // Require two identical observations of the changed input. This makes
+        // the configured polling period a real debounce window and avoids
+        // opening pack.zip while Oraxen is still replacing it.
+        if (++stableFingerprintObservations >= 1) {
+            stableFingerprintObservations = 0;
+            generate("Oraxen files changed", null, null);
+        }
     }
 
     private long calculateFingerprint(BridgeConfig current) {
         long value = 1125899906842597L;
         value = fingerprintPath(current.oraxenDirectory().resolve("items"), value);
+        value = fingerprintPath(current.oraxenDirectory().resolve("glyphs"), value);
         value = fingerprintPath(current.oraxenDirectory().resolve("sound.yml"), value);
-        value = fingerprintPath(current.javaPack(), value);
+        value = fingerprintPath(current.oraxenDirectory().resolve("sounds.yml"), value);
+        Path sourcePack = current.oraxenDirectory().resolve("pack").normalize();
+        value = fingerprintPath(sourcePack, value);
+        if (!current.javaPack().toAbsolutePath().normalize()
+                .startsWith(sourcePack.toAbsolutePath().normalize()))
+            value = fingerprintPath(current.javaPack(), value);
         value = fingerprintPath(plugin.getDataFolder().toPath().resolve("overrides"), value);
         return value;
     }
@@ -125,12 +166,18 @@ final class ConversionManager {
                                Consumer<ConversionResult> success,
                                Consumer<String> failure,
                                boolean dispatchCallbacks) {
+        long inputFingerprint = calculateFingerprint(snapshot);
         try {
             ConversionResult result =
                     new PackConverter(plugin.getDataFolder().toPath()).convert(snapshot);
             lastResult = result;
             lastError = null;
-            fingerprint = calculateFingerprint(snapshot);
+            fingerprint = inputFingerprint;
+            observedFingerprint = inputFingerprint;
+            stableFingerprintObservations = 0;
+            long completedFingerprint = calculateFingerprint(snapshot);
+            if (completedFingerprint != inputFingerprint)
+                requestRerun("Oraxen files changed during conversion");
             plugin.getLogger().info("Bedrock pack ready: " + result.items() + " items, "
                     + result.blocks() + " blocks, " + result.warnings().size() + " warnings.");
             if (success != null) dispatch(success, result, dispatchCallbacks);
@@ -141,7 +188,56 @@ final class ConversionManager {
             if (snapshot.verbose()) exception.printStackTrace();
             if (failure != null) dispatch(failure, message, dispatchCallbacks);
         } finally {
-            running.set(false);
+            finishGeneration();
+        }
+    }
+
+    private void requestRerun(String reason) {
+        synchronized (generationLock) {
+            rerunReason = reason;
+            rerunRequested = true;
+        }
+    }
+
+    private boolean beginGeneration(String reason) {
+        synchronized (generationLock) {
+            if (running.get()) {
+                rerunReason = reason;
+                rerunRequested = true;
+                return false;
+            }
+            running.set(true);
+            return true;
+        }
+    }
+
+    private void finishGeneration() {
+        String queuedReason;
+        BridgeConfig queuedConfig;
+        synchronized (generationLock) {
+            if (!rerunRequested) {
+                running.set(false);
+                return;
+            }
+            rerunRequested = false;
+            queuedReason = rerunReason;
+            rerunReason = null;
+            queuedConfig = config;
+            // Keep running=true so a request cannot slip between consuming the
+            // queued flag and dispatching this reserved follow-up pass.
+        }
+        String reason = queuedReason == null
+                ? "queued input change" : queuedReason;
+        plugin.getLogger().info("Starting Bedrock pack generation (" + reason + ")...");
+        try {
+            Bukkit.getScheduler().runTaskAsynchronously(plugin,
+                    () -> runGeneration(queuedConfig, null, null, true));
+        } catch (RuntimeException exception) {
+            synchronized (generationLock) {
+                running.set(false);
+            }
+            plugin.getLogger().severe("Could not schedule queued Bedrock conversion: "
+                    + errorMessage(exception));
         }
     }
 

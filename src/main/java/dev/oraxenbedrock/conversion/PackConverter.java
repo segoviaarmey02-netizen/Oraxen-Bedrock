@@ -46,6 +46,10 @@ public final class PackConverter {
         int mappedItemCount = 0;
         try (PackSource source = PackSource.open(config.javaPack(),
                 config.oraxenDirectory().resolve("pack"))) {
+            if (source.effectiveAssetFiles().isEmpty())
+                throw new IOException("Java resource pack contains no assets; refusing to "
+                        + "replace the existing Bedrock pack. Check paths.java-pack and "
+                        + "the root directory inside " + config.javaPack());
             JavaPackMetadata javaPackMetadata = source.metadata();
             if (javaPackMetadata.predatesSupportedRange())
                 warnings.add("Java resource pack format " + javaPackMetadata.description()
@@ -542,13 +546,15 @@ public final class PackConverter {
             if (config.copyUi()) copyMatching(source, bedrock, this::isUiTexture, warnings);
             if (config.copySounds()) {
                 SoundConverter.Result sounds = new SoundConverter(source, bedrock,
-                        config.oraxenDirectory(), ORAXEN_NAMESPACE).convert(items, warnings);
+                        config.oraxenDirectory(), "minecraft").convert(items, warnings);
                 soundEventCount = sounds.events();
                 soundFileCount = sounds.files();
             }
             if (config.convertGlyphs()) {
                 FontConverter.Result fonts = new FontConverter(
-                        source, bedrock, config.emojiCellSize()).convert(warnings);
+                        source, bedrock, config.emojiCellSize(),
+                        config.oraxenDirectory().resolve("glyphs"))
+                        .convert(warnings);
                 glyphCount = fonts.glyphs();
                 glyphPageCount = fonts.pages();
             }
@@ -567,6 +573,8 @@ public final class PackConverter {
                         flipbookTextures);
             if (config.applyOverrides())
                 applyOverrides(bedrock, itemMappings, blockMappings, warnings);
+            ensureMeaningfulPack(bedrock, itemMappings, blockMappings,
+                    config, items, warnings);
             JsonSupport.write(generated.resolve("oraxen-items.json"), itemMappings);
             JsonSupport.write(generated.resolve("oraxen-blocks.json"), blockMappings);
             PackValidator.Result validation =
@@ -575,8 +583,7 @@ public final class PackConverter {
             warnings.addAll(validation.warnings());
             if (source.fallbackAssetCount() > 0)
                 warnings.add("Recovered " + source.fallbackAssetCount()
-                        + " model/texture references from the uncompressed "
-                        + "Oraxen pack source");
+                        + " asset files from the uncompressed Oraxen pack source");
             copiedTextures = countPngFiles(bedrock);
 
             Path localPack = generated.resolve("OraxenBedrock.mcpack");
@@ -639,24 +646,14 @@ public final class PackConverter {
 
     private Map<String, List<BlockVariant>> readBlockStates(PackSource source, List<String> warnings) {
         Map<String, List<BlockVariant>> modelToState = new HashMap<>();
-        if (source.assetRoots().isEmpty()) return modelToState;
         try {
             Map<String, Path> stateFiles = new LinkedHashMap<>();
-            for (Path assets : source.assetRoots()) {
-                try (Stream<Path> namespaces = Files.list(assets)) {
-                    for (Path namespaceRoot : namespaces.filter(Files::isDirectory).sorted().toList()) {
-                        Path blockstates = namespaceRoot.resolve("blockstates");
-                        if (!Files.isDirectory(blockstates)) continue;
-                        String namespace = namespaceRoot.getFileName().toString();
-                        try (Stream<Path> paths = Files.walk(blockstates)) {
-                            for (Path path : paths.filter(p -> p.toString().endsWith(".json")).toList()) {
-                                String relative = blockstates.relativize(path).toString()
-                                        .replace('\\', '/');
-                                stateFiles.put(namespace + ":" + relative, path);
-                            }
-                        }
-                    }
-                }
+            for (PackSource.AssetFile asset : source.effectiveAssetFiles()) {
+                String relative = asset.relative().replace('\\', '/');
+                if (!relative.startsWith("blockstates/")
+                        || !relative.endsWith(".json")) continue;
+                stateFiles.put(asset.namespace() + ":"
+                        + relative.substring("blockstates/".length()), asset.path());
             }
             for (Map.Entry<String, Path> stateFile : stateFiles.entrySet()) {
                 Path path = stateFile.getValue();
@@ -1464,8 +1461,8 @@ public final class PackConverter {
 
     private void copyPackIcon(PackSource source, Path bedrock, List<String> warnings) {
         for (String name : List.of("pack.png", "pack_icon.png")) {
-            Path icon = source.root().resolve(name);
-            if (!Files.isRegularFile(icon)) continue;
+            Path icon = source.findPackFile(name);
+            if (icon == null) continue;
             try {
                 copy(icon, bedrock.resolve("pack_icon.png"));
             } catch (IOException ex) {
@@ -1488,7 +1485,15 @@ public final class PackConverter {
                 String name = file.getFileName().toString();
                 if (name.equals("README.txt") || name.equals("item-mappings.json")
                         || name.equals("block-mappings.json")) continue;
-                copy(file, bedrock.resolve(overrides.relativize(file).toString()));
+                String relative = overrides.relativize(file).toString()
+                        .replace('\\', '/');
+                if (isIgnoredOverride(relative)) continue;
+                Path target = bedrock.resolve(relative);
+                if (Files.isRegularFile(target)
+                        && relative.matches("(?i)font/glyph_[0-9a-f]{2}\\.png"))
+                    warnings.add("Native override replaced generated glyph page: "
+                            + relative);
+                copy(file, target);
             }
         }
         warnings.add("Native Bedrock overrides applied");
@@ -2104,6 +2109,79 @@ public final class PackConverter {
                 zip.closeEntry();
             }
         }
+    }
+
+    private void ensureMeaningfulPack(Path bedrock, JsonObject itemMappings,
+                                      JsonObject blockMappings,
+                                      BridgeConfig config,
+                                      List<OraxenItem> items,
+                                      List<String> warnings) throws IOException {
+        long expectedItems = items.stream().filter(this::expectsCustomMapping).count();
+        JsonObject mappedItems = itemMappings.getAsJsonObject("items");
+        if (config.convertItems() && expectedItems > 0
+                && (mappedItems == null || mappedItems.isEmpty())) {
+            String diagnostic = warnings.stream()
+                    .filter(warning -> warning.contains("Skipped custom mapping"))
+                    .findFirst().orElse(warnings.isEmpty() ? "" : warnings.get(0));
+            throw new IOException("No custom Oraxen item could be mapped from "
+                    + expectedItems + " configured pack item(s); the previous pack was kept"
+                    + (diagnostic.isBlank() ? "." : ". First diagnostic: " + diagnostic));
+        }
+
+        JsonObject mappedBlocks = blockMappings.getAsJsonObject("blocks");
+        boolean mappings = mappedItems != null && !mappedItems.isEmpty()
+                || mappedBlocks != null && !mappedBlocks.isEmpty();
+        try (Stream<Path> paths = Files.walk(bedrock)) {
+            boolean resources = paths.filter(Files::isRegularFile)
+                    .anyMatch(path -> isMeaningfulResource(bedrock, path));
+            if (!(mappings || resources))
+                throw new IOException("Conversion produced no usable Bedrock assets; "
+                        + "the previous pack was kept. Check the server log, Oraxen item "
+                        + "YAML, and the Java pack layout");
+        }
+    }
+
+    private boolean expectsCustomMapping(OraxenItem item) {
+        return item.model() != null || item.itemModel() != null
+                || item.customModelData() != null || item.parentModel() != null
+                || !item.textures().isEmpty() || !item.packModels().isEmpty()
+                || item.isBlock() || item.isFurniture() || item.isHat()
+                || item.isCosmeticBackpack()
+                || !Maps.section(item.components(), "equippable").isEmpty();
+    }
+
+    private boolean isMeaningfulResource(Path bedrock, Path file) {
+        String relative = bedrock.relativize(file).toString().replace('\\', '/');
+        if (isIgnoredOverride(relative)
+                || relative.equals("manifest.json")
+                || relative.equals("pack_icon.png")) return false;
+        if (relative.equals("textures/item_texture.json")
+                || relative.equals("textures/terrain_texture.json")) {
+            try {
+                JsonObject atlas = JsonSupport.readObject(file);
+                JsonObject entries = atlas.getAsJsonObject("texture_data");
+                return entries != null && !entries.isEmpty();
+            } catch (IOException | RuntimeException ignored) {
+                return false;
+            }
+        }
+        int slash = relative.indexOf('/');
+        String root = slash < 0 ? relative : relative.substring(0, slash);
+        return Set.of("animation_controllers", "animations", "attachables",
+                "entity", "fogs", "font", "materials", "models", "particles",
+                "render_controllers", "sounds", "texts", "textures", "ui")
+                .contains(root)
+                || Set.of("biomes_client.json", "blocks.json", "sounds.json")
+                .contains(relative);
+    }
+
+    private static boolean isIgnoredOverride(String relative) {
+        String normalized = relative.replace('\\', '/');
+        return Arrays.stream(normalized.split("/"))
+                .anyMatch(segment -> segment.startsWith(".")
+                        || segment.equalsIgnoreCase("Thumbs.db")
+                        || segment.equalsIgnoreCase("desktop.ini")
+                        || segment.equalsIgnoreCase("__MACOSX"));
     }
 
     private void atomicInstall(Path source, Path destination) throws IOException {

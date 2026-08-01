@@ -4,6 +4,9 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import dev.oraxenbedrock.io.PackSource;
+import org.yaml.snakeyaml.LoaderOptions;
+import org.yaml.snakeyaml.Yaml;
+import org.yaml.snakeyaml.constructor.SafeConstructor;
 
 import javax.imageio.ImageIO;
 import java.awt.AlphaComposite;
@@ -16,7 +19,7 @@ import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
-import java.util.List;
+import java.util.stream.Stream;
 
 /**
  * Packs Java bitmap font providers into Bedrock's 256-codepoint glyph pages.
@@ -39,24 +42,40 @@ final class FontConverter {
     private final PackSource source;
     private final Path bedrock;
     private final int minEmojiCell;
+    private final Path glyphConfigDirectory;
 
     FontConverter(PackSource source, Path bedrock) {
         this(source, bedrock, DEFAULT_EMOJI_CELL);
     }
 
     FontConverter(PackSource source, Path bedrock, int minEmojiCell) {
+        this(source, bedrock, minEmojiCell, null);
+    }
+
+    FontConverter(PackSource source, Path bedrock, int minEmojiCell,
+                  Path glyphConfigDirectory) {
         this.source = source;
         this.bedrock = bedrock;
         this.minEmojiCell = powerOfTwoCell(
                 Math.max(MIN_CELL, Math.min(MAX_CELL, minEmojiCell)));
+        this.glyphConfigDirectory = glyphConfigDirectory;
     }
 
     Result convert(List<String> warnings) throws IOException {
         Map<Integer, Map<Integer, Glyph>> pages = new TreeMap<>();
-        if (source.assetRoots().isEmpty()) return new Result(0, 0);
-
-        for (PackSource.AssetFile asset : source.effectiveAssetFiles()) {
-            if (!isFontDefinition(asset.relative())) continue;
+        Set<Integer> oraxenGlyphCodepoints =
+                readConfiguredGlyphCodepoints(warnings);
+        int fontDefinitions = 0;
+        int bitmapProviders = 0;
+        List<PackSource.AssetFile> fontAssets = source.effectiveAssetFiles().stream()
+                .filter(asset -> isFontDefinition(asset.relative()))
+                // Java searches providers in declaration order. The generated
+                // ZIP is authoritative over the uncompressed fallback even
+                // when the two definitions use different namespaces.
+                .sorted(Comparator.comparing(PackSource.AssetFile::fallback))
+                .toList();
+        for (PackSource.AssetFile asset : fontAssets) {
+            fontDefinitions++;
             Path file = asset.path();
             try {
                 JsonArray providers = JsonSupport.readObject(file).getAsJsonArray("providers");
@@ -64,11 +83,23 @@ final class FontConverter {
                 for (JsonElement value : providers) {
                     if (!value.isJsonObject()) continue;
                     JsonObject provider = value.getAsJsonObject();
-                    if (!provider.has("type")
-                            || !provider.get("type").getAsString()
-                            .replaceFirst("^minecraft:", "").equals("bitmap"))
-                        continue;
-                    readProvider(provider, pages, warnings);
+                    try {
+                        if (!provider.has("type")) continue;
+                        String type = provider.get("type").getAsString()
+                                .replaceFirst("^minecraft:", "");
+                        if (!type.equals("bitmap")) {
+                            if (type.equals("ttf") || type.equals("unihex"))
+                                warnings.add("Unsupported Java font provider '" + type
+                                        + "' in " + file);
+                            continue;
+                        }
+                        bitmapProviders++;
+                        readProvider(provider, pages, oraxenGlyphCodepoints,
+                                warnings);
+                    } catch (IOException | RuntimeException ex) {
+                        warnings.add("Could not convert bitmap provider in "
+                                + file + ": " + ex.getMessage());
+                    }
                 }
             } catch (IOException | RuntimeException ex) {
                 warnings.add("Could not convert bitmap font " + file + ": " + ex.getMessage());
@@ -85,8 +116,9 @@ final class FontConverter {
                 int index = glyph.getKey();
                 Glyph definition = glyph.getValue();
                 BufferedImage image = definition.image();
-                int visualSize = isPrivateUsePage(page)
-                        ? visualCellSize(page, definition) : cellSize;
+                int visualSize = definition.emoji()
+                        ? visualCellSize(definition)
+                        : intrinsicCellSize(definition);
                 Target target = fit(image.getWidth(), image.getHeight(),
                         index % 16 * cellSize, index / 16 * cellSize, cellSize,
                         visualSize, definition.height(), definition.ascent());
@@ -101,11 +133,18 @@ final class FontConverter {
                     throw new IOException("No PNG writer is available for " + target);
             }
         }
+        if (fontDefinitions > 0 && bitmapProviders == 0)
+            warnings.add("Java font definitions were found, but none contain "
+                    + "convertible bitmap glyphs");
+        else if (bitmapProviders > 0 && glyphCount == 0)
+            warnings.add("Java bitmap font providers were found, but no visible "
+                    + "Bedrock glyphs could be generated");
         return new Result(glyphCount, pages.size());
     }
 
     private void readProvider(JsonObject provider,
                               Map<Integer, Map<Integer, Glyph>> pages,
+                              Set<Integer> oraxenGlyphCodepoints,
                               List<String> warnings) throws IOException {
         if (!provider.has("file") || !provider.has("chars")
                 || !provider.get("chars").isJsonArray()) return;
@@ -178,11 +217,13 @@ final class FontConverter {
                 }
                 int page = codepoint >>> 8;
                 int cell = codepoint & 0xFF;
+                Glyph definition = new Glyph(visibleGlyph, renderHeight, ascent,
+                        isEmojiCodepoint(codepoint, oraxenGlyphCodepoints));
                 Glyph old = pages.computeIfAbsent(page, ignored -> new TreeMap<>())
-                        .put(cell, new Glyph(visibleGlyph, renderHeight, ascent));
+                        .putIfAbsent(cell, definition);
                 if (old != null) warnings.add("Duplicate bitmap provider for U+"
                         + String.format(Locale.ROOT, "%04X", codepoint)
-                        + "; the last provider wins");
+                        + "; the first provider was kept");
             }
         }
     }
@@ -223,19 +264,150 @@ final class FontConverter {
         for (Glyph glyph : glyphs) {
             required = Math.max(required, Math.max(
                     glyph.image().getWidth(), glyph.image().getHeight()));
-            required = Math.max(required, visualCellSize(page, glyph));
+            if (glyph.emoji())
+                required = Math.max(required, visualCellSize(glyph));
         }
         return powerOfTwoCell(required);
     }
 
-    private int visualCellSize(int page, Glyph glyph) {
-        if (!isPrivateUsePage(page)) return MIN_CELL;
+    private int visualCellSize(Glyph glyph) {
         int requested = Math.max(minEmojiCell, glyph.height() * 2);
         return powerOfTwoCell(requested);
     }
 
-    private static boolean isPrivateUsePage(int page) {
-        return page >= 0xE0 && page <= 0xF8;
+    private int intrinsicCellSize(Glyph glyph) {
+        return powerOfTwoCell(Math.max(MIN_CELL, Math.max(
+                glyph.image().getWidth(), glyph.image().getHeight())));
+    }
+
+    private boolean isEmojiCodepoint(int codepoint,
+                                     Set<Integer> oraxenGlyphCodepoints) {
+        // Oraxen auto-assigns glyphs from decimal 42000 (U+A410), outside the
+        // private-use area. Only codes actually declared by Oraxen are scaled;
+        // treating the whole interval as emoji would also enlarge real Unicode
+        // scripts such as Hangul.
+        return codepoint >= 0xE000 && codepoint <= 0xF8FF
+                || oraxenGlyphCodepoints.contains(codepoint);
+    }
+
+    private Set<Integer> readConfiguredGlyphCodepoints(List<String> warnings) {
+        if (glyphConfigDirectory == null
+                || !Files.isDirectory(glyphConfigDirectory)) return Set.of();
+        Set<Integer> result = new LinkedHashSet<>();
+        List<Map<?, ?>> configuredGlyphs = new ArrayList<>();
+        LoaderOptions options = new LoaderOptions();
+        options.setAllowDuplicateKeys(false);
+        Yaml yaml = new Yaml(new SafeConstructor(options));
+        try (Stream<Path> paths = Files.walk(glyphConfigDirectory)) {
+            for (Path file : paths.filter(Files::isRegularFile)
+                    .filter(FontConverter::isYaml).sorted().toList()) {
+                try (InputStream input = Files.newInputStream(file)) {
+                    Object document = yaml.load(input);
+                    if (!(document instanceof Map<?, ?> root)) continue;
+                    for (Object value : root.values()) {
+                        if (!(value instanceof Map<?, ?> glyph)) continue;
+                        configuredGlyphs.add(glyph);
+                        Object characters = valueIgnoreCase(glyph, "char");
+                        if (characters == null)
+                            characters = valueIgnoreCase(glyph, "chars");
+                        collectCharacters(characters, result);
+                        Object legacyCode = valueIgnoreCase(glyph, "code");
+                        if (legacyCode instanceof Number number)
+                            result.add(number.intValue());
+                        else if (legacyCode instanceof String text) {
+                            try {
+                                result.add(Integer.parseInt(text.trim()));
+                            } catch (NumberFormatException ignored) {
+                                // Oraxen only treats numeric legacy codes as codes.
+                            }
+                        }
+                    }
+                } catch (IOException | RuntimeException exception) {
+                    warnings.add("Could not read Oraxen glyph configuration "
+                            + file + ": " + exception.getMessage());
+                }
+            }
+        } catch (IOException exception) {
+            warnings.add("Could not scan Oraxen glyph configurations: "
+                    + exception.getMessage());
+        }
+        // With disable_automatic_glyph_code enabled, Oraxen still assigns
+        // sequential characters to generated providers but intentionally does
+        // not write them back to YAML. Mirror that allocation so U+A410+
+        // glyphs keep their configured Bedrock size in this mode too.
+        for (Map<?, ?> glyph : configuredGlyphs) {
+            if (hasConfiguredCharacters(glyph)
+                    || valueIgnoreCase(glyph, "reference") instanceof Map<?, ?>
+                    || (valueIgnoreCase(glyph, "texture") != null
+                    && valueIgnoreCase(glyph, "animation") instanceof Map<?, ?>))
+                continue;
+            Map<?, ?> grid = valueIgnoreCase(glyph, "grid") instanceof Map<?, ?> map
+                    ? map : Map.of();
+            int rows = positiveInt(valueIgnoreCase(glyph, "rows"),
+                    positiveInt(valueIgnoreCase(grid, "rows"), 1));
+            Object columnsValue = valueIgnoreCase(glyph, "columns");
+            if (columnsValue == null) columnsValue = valueIgnoreCase(glyph, "cols");
+            int columns = positiveInt(columnsValue,
+                    positiveInt(valueIgnoreCase(grid, "columns"), 1));
+            for (int cell = 0; cell < rows * columns; cell++) {
+                int codepoint = 42000;
+                while (result.contains(codepoint)) codepoint++;
+                result.add(codepoint);
+            }
+        }
+        return result;
+    }
+
+    private static boolean hasConfiguredCharacters(Map<?, ?> glyph) {
+        Object characters = valueIgnoreCase(glyph, "char");
+        if (characters == null) characters = valueIgnoreCase(glyph, "chars");
+        if (characters instanceof String text && !text.isBlank()) return true;
+        if (characters instanceof Collection<?> values && !values.isEmpty()) return true;
+        Object code = valueIgnoreCase(glyph, "code");
+        if (code instanceof Number) return true;
+        if (code instanceof String text)
+            try {
+                Integer.parseInt(text.trim());
+                return true;
+            } catch (NumberFormatException ignored) {
+                return false;
+            }
+        return false;
+    }
+
+    private static int positiveInt(Object value, int fallback) {
+        int parsed;
+        if (value instanceof Number number) parsed = number.intValue();
+        else if (value instanceof String text)
+            try {
+                parsed = Integer.parseInt(text.trim());
+            } catch (NumberFormatException ignored) {
+                return fallback;
+            }
+        else return fallback;
+        return Math.max(1, parsed);
+    }
+
+    private static void collectCharacters(Object value, Set<Integer> result) {
+        if (value instanceof Collection<?> values) {
+            values.forEach(entry -> collectCharacters(entry, result));
+        } else if (value instanceof String text) {
+            text.codePoints().forEach(result::add);
+        } else if (value instanceof Character character) {
+            result.add((int) character);
+        }
+    }
+
+    private static Object valueIgnoreCase(Map<?, ?> map, String key) {
+        for (Map.Entry<?, ?> entry : map.entrySet())
+            if (String.valueOf(entry.getKey()).equalsIgnoreCase(key))
+                return entry.getValue();
+        return null;
+    }
+
+    private static boolean isYaml(Path path) {
+        String name = path.getFileName().toString().toLowerCase(Locale.ROOT);
+        return name.endsWith(".yml") || name.endsWith(".yaml");
     }
 
     private static int powerOfTwoCell(int required) {
@@ -299,5 +471,6 @@ final class FontConverter {
     }
 
     private record Target(int x, int y, int width, int height) {}
-    private record Glyph(BufferedImage image, int height, int ascent) {}
+    private record Glyph(BufferedImage image, int height, int ascent,
+                         boolean emoji) {}
 }

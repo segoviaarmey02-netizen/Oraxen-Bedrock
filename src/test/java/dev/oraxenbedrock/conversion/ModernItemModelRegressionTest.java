@@ -700,14 +700,10 @@ class ModernItemModelRegressionTest {
                 true, false, false, false, false, false, false,
                 false, false, 100, false);
 
-        ConversionResult result = new PackConverter(data).convert(config);
-        JsonObject mapped = JsonSupport.readObject(result.mappings())
-                .getAsJsonObject("items");
-        assertFalse(mapped.has("minecraft:paper"),
-                "An ambiguous numeric CMD must not be assigned arbitrarily");
-        assertTrue(result.warnings().stream().anyMatch(warning ->
-                warning.contains("ambiguous_float")
-                        && warning.contains("multiple obfuscated")));
+        IOException error = assertThrows(IOException.class,
+                () -> new PackConverter(data).convert(config));
+        assertTrue(error.getMessage().contains("No custom Oraxen item"));
+        assertTrue(error.getMessage().contains("ambiguous_float"));
     }
 
     @Test

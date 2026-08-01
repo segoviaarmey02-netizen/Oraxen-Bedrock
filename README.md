@@ -18,8 +18,9 @@ generation.
 - `plugins/Geyser-Spigot/custom_mappings/oraxen-blocks.json` (block states)
 - `plugins/OraxenBedrock/last-report.json` (conversion diagnostics)
 
-The converter reads Oraxen YAML plus its generated `pack/pack.zip`. It
-supports regular 2D items, generated cube/cutout blocks, Oraxen note/string/
+The converter reads Oraxen YAML plus its generated `pack/pack.zip`. Wrapped
+ZIP exports and Oraxen's uncompressed flat `pack/` folders are detected too.
+It supports regular 2D items, generated cube/cutout blocks, Oraxen note/string/
 chorus/shaped block states, named sounds, bitmap fonts/emojis, localizations,
 pack icons, and namespaced GUI texture transfer. Java block states are
 discovered across every namespace in Oraxen's generated
@@ -84,8 +85,10 @@ Resource-pack metadata is version-aware across the full supported range:
   by a hard-coded upper version limit.
 
 Custom audio is registered in Bedrock `sounds/sound_definitions.json`, not
-merely copied. Oraxen `sound.yml` categories and streaming flags are preserved,
-and items with `Components.jukebox_playable` force the matching song into the
+merely copied. Current Oraxen `sounds.yml` list entries (including its
+`minecraft` default namespace) and legacy `sound.yml` maps preserve their
+categories and streaming flags, and items with
+`Components.jukebox_playable` force the matching song into the
 `record` category with streaming enabled. This lets Geyser translate custom
 sound events used by music discs.
 
@@ -94,6 +97,12 @@ pages. This covers Oraxen emoji and other BMP private-use glyphs in chat,
 names, lore, scoreboards, and menus. Bedrock has no glyph page for
 supplementary code points above `U+FFFF`; those are reported rather than
 silently producing a broken font.
+
+Oraxen's auto-assigned glyph sequence beginning at decimal `42000` (`U+A410`)
+receives the configured emoji sizing by matching the exact codes saved in
+`plugins/Oraxen/glyphs/*.yml`; unrelated Unicode scripts are left unchanged.
+When Java font providers repeat a code point, the first provider wins, matching
+Java's font-provider semantics.
 
 Private-use emoji pages use a configurable 64 px minimum cell (1024×1024
 page) by default. Small 8×9 and 16×16 pixel-art emoji are enlarged with
@@ -176,6 +185,11 @@ installation, the converter validates atlas textures, geometries, flipbooks,
 sound files and duplicate identifiers; the checked-reference count and all
 non-fatal approximations are written to `last-report.json`.
 
+An input with no discoverable Java assets, a configured custom-item set that
+produces no mappings, or an output containing only pack scaffolding is rejected
+before installation, so a valid existing Bedrock pack is never replaced by an
+empty one.
+
 Minecraft Java shaders and the exact placement/animation behavior of runtime
 display-entity furniture have no lossless Bedrock resource-pack equivalent.
 Block-backed decorations are mapped normally; display-entity furniture keeps
@@ -198,7 +212,7 @@ Requires JDK 21+ and Maven:
 mvn clean package
 ```
 
-Install `target/OraxenBedrock-2.7.1.jar` alongside Oraxen and Geyser, then
+Install `target/OraxenBedrock-2.7.2.jar` alongside Oraxen and Geyser, then
 restart the server. By default the bridge enables
 `gameplay.enable-custom-content: true` in an existing Geyser config before
 Geyser starts; this can be disabled with
@@ -206,9 +220,10 @@ Geyser starts; this can be disabled with
 The declared plugin initialization order is Oraxen, OraxenBedrock, then
 Geyser-Spigot. When Oraxen's Java pack already exists, the initial conversion
 is completed before Geyser-Spigot enables so it can discover the mappings on
-the same server start. Later Oraxen pack generations are detected from
-`OraxenPackGeneratedEvent` after the archive has been fully written, with file
-watching as a fallback. Geyser itself still requires a restart to load mapping
+the same server start. Later Oraxen pack generations trigger a readiness probe
+from `OraxenPackGeneratedEvent`; conversion starts only after the ZIP is
+readable and stable, with file watching as a fallback. Geyser itself still
+requires a restart to load mapping
 files changed while it is already running. On a completely fresh installation
 where Oraxen creates its first `pack.zip` after Geyser startup, the bridge
 generates the Bedrock files automatically and logs that one additional restart

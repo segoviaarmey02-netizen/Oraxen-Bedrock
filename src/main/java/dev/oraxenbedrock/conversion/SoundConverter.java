@@ -63,7 +63,8 @@ final class SoundConverter {
             }
         }
 
-        // sound.yml is also accepted directly. This covers installations where
+        // sounds.yml (and legacy sound.yml) is also accepted directly. This
+        // covers installations where
         // Oraxen's generated sounds.json has not yet been put into pack.zip.
         for (Map.Entry<String, SoundMetadata> entry : metadata.entrySet()) {
             if (definitions.has(entry.getKey()) || entry.getValue().files().isEmpty()) continue;
@@ -120,10 +121,11 @@ final class SoundConverter {
 
     private JsonObject convertMetadata(String eventId, SoundMetadata metadata, boolean record,
                                        Set<String> copied, List<String> warnings) throws IOException {
-        String namespace = namespace(eventId);
         JsonArray sounds = new JsonArray();
         for (String file : metadata.files()) {
-            JsonObject sound = installSound(file, namespace, copied, warnings);
+            // Current Oraxen resolves an unqualified sound file reference in
+            // the minecraft namespace even when the event id is namespaced.
+            JsonObject sound = installSound(file, "minecraft", copied, warnings);
             if (sound == null) continue;
             if (record || metadata.stream()) sound.addProperty("stream", true);
             sounds.add(sound);
@@ -172,29 +174,47 @@ final class SoundConverter {
     }
 
     private Map<String, SoundMetadata> readOraxenMetadata(List<String> warnings) {
-        Path file = oraxenDirectory.resolve("sound.yml");
+        Path file = Files.isRegularFile(oraxenDirectory.resolve("sounds.yml"))
+                ? oraxenDirectory.resolve("sounds.yml")
+                : oraxenDirectory.resolve("sound.yml");
         if (!Files.isRegularFile(file)) return Map.of();
         try (InputStream input = Files.newInputStream(file)) {
             LoaderOptions options = new LoaderOptions();
             options.setAllowDuplicateKeys(false);
             Object document = new Yaml(new SafeConstructor(options)).load(input);
             if (!(document instanceof Map<?, ?> root)) return Map.of();
-            Map<String, Object> sounds = Maps.section(root, "sounds");
             Map<String, SoundMetadata> result = new LinkedHashMap<>();
-            for (Map.Entry<String, Object> entry : sounds.entrySet()) {
-                if (!(entry.getValue() instanceof Map<?, ?> raw)) continue;
-                String id = identifier(entry.getKey(), defaultNamespace);
-                String category = Maps.string(raw, "category");
-                boolean stream = booleanValue(Maps.get(raw, "stream"));
-                List<String> files = stringList(Maps.get(raw, "sound"));
-                if (files.isEmpty()) files = stringList(Maps.get(raw, "sounds"));
-                result.put(id, new SoundMetadata(normalizeCategory(category), stream, files));
+            Object soundsValue = Maps.get(root, "sounds");
+            if (soundsValue instanceof Map<?, ?> sounds) {
+                for (Map.Entry<?, ?> entry : sounds.entrySet()) {
+                    if (!(entry.getValue() instanceof Map<?, ?> raw)) continue;
+                    addSoundMetadata(result, String.valueOf(entry.getKey()), raw);
+                }
+            } else if (soundsValue instanceof Collection<?> sounds) {
+                for (Object value : sounds) {
+                    if (!(value instanceof Map<?, ?> raw)) continue;
+                    String id = Maps.string(raw, "id");
+                    if (id == null) id = Maps.string(raw, "key");
+                    if (id != null) addSoundMetadata(result, id, raw);
+                }
             }
             return result;
         } catch (IOException | RuntimeException ex) {
-            warnings.add("Could not parse Oraxen sound.yml: " + ex.getMessage());
+            warnings.add("Could not parse Oraxen sound configuration "
+                    + file.getFileName() + ": " + ex.getMessage());
             return Map.of();
         }
+    }
+
+    private void addSoundMetadata(Map<String, SoundMetadata> result,
+                                  String rawId, Map<?, ?> raw) {
+        String id = identifier(rawId, defaultNamespace);
+        String category = Maps.string(raw, "category");
+        boolean stream = booleanValue(Maps.get(raw, "stream"));
+        List<String> files = stringList(Maps.get(raw, "sound"));
+        if (files.isEmpty()) files = stringList(Maps.get(raw, "sounds"));
+        result.put(id, new SoundMetadata(
+                normalizeCategory(category), stream, files));
     }
 
     private Set<String> recordSounds(List<OraxenItem> items) {
@@ -203,7 +223,14 @@ final class SoundConverter {
             Map<String, Object> component = Maps.section(item.components(), "jukebox_playable");
             String key = Maps.string(component, "song_key");
             if (key == null) key = Maps.string(component, "song");
-            if (key != null) result.add(identifier(key, defaultNamespace));
+            if (key != null) {
+                String id = identifier(key, defaultNamespace);
+                result.add(id);
+                // Oraxen migrates legacy unqualified sound events to
+                // minecraft:<key> while keeping oraxen:<key> jukebox song ids.
+                if (id.startsWith("oraxen:"))
+                    result.add("minecraft:" + id.substring("oraxen:".length()));
+            }
         }
         return result;
     }
@@ -241,11 +268,6 @@ final class SoundConverter {
     private static String identifier(String value, String namespace) {
         String clean = value.toLowerCase(Locale.ROOT).replace('\\', '/');
         return clean.contains(":") ? clean : namespace + ":" + clean;
-    }
-
-    private static String namespace(String identifier) {
-        int colon = identifier.indexOf(':');
-        return colon < 0 ? "minecraft" : identifier.substring(0, colon);
     }
 
     private static List<String> stringList(Object value) {

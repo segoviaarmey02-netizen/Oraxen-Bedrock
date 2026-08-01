@@ -5,6 +5,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
 import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
@@ -70,7 +71,34 @@ final class PackValidator {
         checked += validateAttachables(bedrock, generatedNamespace, warnings);
         checked += validateFlipbooks(bedrock, warnings);
         checked += validateSounds(bedrock, warnings);
+        checked += validateFonts(bedrock);
         return new Result(checked, List.copyOf(warnings));
+    }
+
+    private int validateFonts(Path bedrock) throws IOException {
+        Path fonts = bedrock.resolve("font");
+        if (!Files.isDirectory(fonts)) return 0;
+        int checked = 0;
+        try (Stream<Path> paths = Files.list(fonts)) {
+            for (Path file : paths.filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString()
+                            .matches("(?i)glyph_[0-9a-f]{2}\\.png"))
+                    .toList()) {
+                checked++;
+                BufferedImage image;
+                try (InputStream input = Files.newInputStream(file)) {
+                    image = ImageIO.read(input);
+                }
+                if (image == null)
+                    throw new IOException("Unreadable Bedrock glyph page: "
+                            + file.getFileName());
+                if (image.getWidth() != image.getHeight()
+                        || image.getWidth() % 16 != 0)
+                    throw new IOException("Bedrock glyph page must be square with "
+                            + "a 16x16 grid: " + file.getFileName());
+            }
+        }
+        return checked;
     }
 
     private int validateItemIcons(Path bedrock, JsonObject itemMappings,

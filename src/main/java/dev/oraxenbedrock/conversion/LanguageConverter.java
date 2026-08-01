@@ -16,7 +16,6 @@ final class LanguageConverter {
 
     Result convert(PackSource source, Path bedrock, List<String> warnings) {
         Map<String, SortedMap<String, String>> languages = new TreeMap<>();
-        if (source.assetRoots().isEmpty()) return new Result(0, 0);
         try {
             for (PackSource.AssetFile asset : source.effectiveAssetFiles()) {
                 if (!asset.relative().startsWith("lang/")) continue;

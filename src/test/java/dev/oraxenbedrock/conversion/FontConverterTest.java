@@ -126,6 +126,119 @@ class FontConverterTest {
     }
 
     @Test
+    void usesConfiguredEmojiCellSizeForOraxenAutoAssignedCodepoint() throws Exception {
+        Path textures = temp.resolve("assets/oraxen/textures/font");
+        Path fonts = temp.resolve("assets/oraxen/font");
+        Files.createDirectories(textures);
+        Files.createDirectories(fonts);
+        Files.writeString(temp.resolve("pack.mcmeta"),
+                "{\"pack\":{\"pack_format\":32,\"description\":\"font test\"}}");
+        writeSolidPng(textures.resolve("auto.png"), 8, 8, 0xFFFFFFFF);
+        Files.writeString(fonts.resolve("default.json"), """
+                {"providers":[{"type":"bitmap","file":"oraxen:font/auto.png",
+                  "height":8,"ascent":8,"chars":["\uA410"]}]}
+                """);
+
+        Path bedrock = temp.resolve("bedrock-auto");
+        Path glyphs = temp.resolve("glyphs");
+        Files.createDirectories(glyphs);
+        Files.writeString(glyphs.resolve("emoji.yml"), """
+                auto_emoji:
+                  texture: font/auto
+                """);
+        List<String> warnings = new ArrayList<>();
+        try (PackSource source = PackSource.open(temp)) {
+            FontConverter.Result result = new FontConverter(
+                    source, bedrock, 64, glyphs)
+                    .convert(warnings);
+            assertEquals(1, result.glyphs());
+            assertEquals(1, result.pages());
+        }
+
+        assertTrue(warnings.isEmpty(), () -> String.join("\n", warnings));
+        BufferedImage page = ImageIO.read(
+                bedrock.resolve("font/glyph_A4.png").toFile());
+        assertNotNull(page);
+        assertEquals(1024, page.getWidth());
+        assertEquals(1024, page.getHeight());
+        Bounds glyph = alphaBounds(page, 0, 64, 64);
+        assertEquals(64, glyph.width());
+        assertEquals(64, glyph.height());
+    }
+
+    @Test
+    void keepsFirstBitmapProviderForDuplicateCodepoint() throws Exception {
+        Path textures = temp.resolve("assets/oraxen/textures/font");
+        Path fonts = temp.resolve("assets/oraxen/font");
+        Files.createDirectories(textures);
+        Files.createDirectories(fonts);
+        Files.writeString(temp.resolve("pack.mcmeta"),
+                "{\"pack\":{\"pack_format\":32,\"description\":\"font test\"}}");
+        int firstColor = 0xFFFF2020;
+        int secondColor = 0xFF2020FF;
+        writeSolidPng(textures.resolve("first.png"), 8, 8, firstColor);
+        writeSolidPng(textures.resolve("second.png"), 8, 8, secondColor);
+        Files.writeString(fonts.resolve("default.json"), """
+                {"providers":[
+                  {"type":"bitmap","file":"oraxen:font/first.png",
+                   "height":8,"ascent":8,"chars":["\uE300"]},
+                  {"type":"bitmap","file":"oraxen:font/second.png",
+                   "height":8,"ascent":8,"chars":["\uE300"]}
+                ]}
+                """);
+
+        Path bedrock = temp.resolve("bedrock-duplicate");
+        List<String> warnings = new ArrayList<>();
+        try (PackSource source = PackSource.open(temp)) {
+            FontConverter.Result result = new FontConverter(source, bedrock)
+                    .convert(warnings);
+            assertEquals(1, result.glyphs());
+            assertEquals(1, result.pages());
+        }
+
+        assertEquals(List.of(
+                "Duplicate bitmap provider for U+E300; the first provider was kept"),
+                warnings);
+        BufferedImage page = ImageIO.read(
+                bedrock.resolve("font/glyph_E3.png").toFile());
+        assertNotNull(page);
+        assertEquals(firstColor, page.getRGB(32, 32));
+        assertNotEquals(secondColor, page.getRGB(32, 32));
+    }
+
+    @Test
+    void convertsCurrentOraxenFlatMinecraftFontFallback() throws Exception {
+        Path primary = temp.resolve("generated");
+        Files.createDirectories(primary);
+        Files.writeString(primary.resolve("pack.mcmeta"),
+                "{\"pack\":{\"pack_format\":75,\"description\":\"font fallback\"}}");
+
+        Path fallback = temp.resolve("oraxen-pack");
+        Path textures = fallback.resolve("textures/font");
+        Path fonts = fallback.resolve("font");
+        Files.createDirectories(textures);
+        Files.createDirectories(fonts);
+        writeSolidPng(textures.resolve("emoji.png"), 8, 8, 0xFFFFAA22);
+        Files.writeString(fonts.resolve("default.json"), """
+                {"providers":[{"type":"bitmap","file":"font/emoji.png",
+                  "height":8,"ascent":8,"chars":["\uA410"]}]}
+                """);
+
+        Path bedrock = temp.resolve("bedrock-fallback");
+        List<String> warnings = new ArrayList<>();
+        try (PackSource source = PackSource.open(primary, fallback)) {
+            FontConverter.Result result = new FontConverter(source, bedrock)
+                    .convert(warnings);
+            assertEquals(1, result.glyphs());
+            assertEquals(1, result.pages());
+        }
+
+        assertTrue(warnings.isEmpty(), () -> String.join("\n", warnings));
+        assertTrue(Files.isRegularFile(
+                bedrock.resolve("font/glyph_A4.png")));
+    }
+
+    @Test
     void leavesNonEmojiBitmapFontSizingUnchanged() throws Exception {
         Path textures = temp.resolve("assets/oraxen/textures/font");
         Path fonts = temp.resolve("assets/oraxen/font");
@@ -150,6 +263,64 @@ class FontConverterTest {
         Bounds glyph = alphaBounds(page, 0, 0, 32);
         assertEquals(32, glyph.width());
         assertEquals(32, glyph.height());
+    }
+
+    @Test
+    void doesNotTreatHangulAsAnOraxenEmojiRange() throws Exception {
+        Path textures = temp.resolve("assets/oraxen/textures/font");
+        Path fonts = temp.resolve("assets/oraxen/font");
+        Files.createDirectories(textures);
+        Files.createDirectories(fonts);
+        writeSolidPng(textures.resolve("hangul.png"), 8, 8, 0xFFFFFFFF);
+        Files.writeString(fonts.resolve("default.json"), """
+                {"providers":[{"type":"bitmap","file":"oraxen:font/hangul.png",
+                  "height":8,"ascent":8,"chars":["\uAC00"]}]}
+                """);
+
+        Path bedrock = temp.resolve("bedrock-hangul");
+        try (PackSource source = PackSource.open(temp)) {
+            new FontConverter(source, bedrock, 64).convert(new ArrayList<>());
+        }
+
+        BufferedImage page = ImageIO.read(
+                bedrock.resolve("font/glyph_AC.png").toFile());
+        assertNotNull(page);
+        assertEquals(256, page.getWidth());
+    }
+
+    @Test
+    void primaryZipFontWinsOverFlatFallbackProvider() throws Exception {
+        Path primary = temp.resolve("primary");
+        Path primaryTextures = primary.resolve("assets/oraxen/textures/font");
+        Path primaryFonts = primary.resolve("assets/oraxen/font");
+        Files.createDirectories(primaryTextures);
+        Files.createDirectories(primaryFonts);
+        int primaryColor = 0xFFFF2020;
+        writeSolidPng(primaryTextures.resolve("primary.png"), 8, 8, primaryColor);
+        Files.writeString(primaryFonts.resolve("default.json"), """
+                {"providers":[{"type":"bitmap","file":"oraxen:font/primary.png",
+                  "height":8,"ascent":8,"chars":["\uE300"]}]}
+                """);
+
+        Path fallback = temp.resolve("fallback");
+        Files.createDirectories(fallback.resolve("font"));
+        Files.createDirectories(fallback.resolve("textures/font"));
+        writeSolidPng(fallback.resolve("textures/font/fallback.png"),
+                8, 8, 0xFF2020FF);
+        Files.writeString(fallback.resolve("font/default.json"), """
+                {"providers":[{"type":"bitmap","file":"font/fallback.png",
+                  "height":8,"ascent":8,"chars":["\uE300"]}]}
+                """);
+
+        Path bedrock = temp.resolve("bedrock-precedence");
+        try (PackSource source = PackSource.open(primary, fallback)) {
+            new FontConverter(source, bedrock).convert(new ArrayList<>());
+        }
+
+        BufferedImage page = ImageIO.read(
+                bedrock.resolve("font/glyph_E3.png").toFile());
+        assertNotNull(page);
+        assertEquals(primaryColor, page.getRGB(32, 32));
     }
 
     private static void writeSolidPng(Path target, int width, int height, int color)

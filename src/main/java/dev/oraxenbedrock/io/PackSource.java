@@ -6,37 +6,65 @@ import java.util.*;
 import java.util.stream.Stream;
 
 public final class PackSource implements AutoCloseable {
-    public record AssetFile(String namespace, String relative, Path path) {}
+    public record AssetFile(String namespace, String relative, Path path,
+                            boolean fallback) {
+        public AssetFile(String namespace, String relative, Path path) {
+            this(namespace, relative, path, false);
+        }
+    }
+
+    private static final List<String> FLAT_ASSET_DIRECTORIES = List.of(
+            "models", "textures", "lang", "font", "sounds");
 
     private final Path root;
     private final FileSystem zipFileSystem;
     private final JavaPackMetadata metadata;
+    private final List<Path> primaryAssetRoots;
+    private final List<Path> fallbackAssetRoots;
     private final List<Path> assetRoots;
     private final Path fallbackPackDirectory;
-    private final Set<String> fallbackAssets = new LinkedHashSet<>();
+    private final Set<Path> fallbackAssets = new LinkedHashSet<>();
     private final Map<String, Optional<Path>> textureCache = new HashMap<>();
     private final Map<String, Map<String, Optional<Path>>> basenameIndexes =
             new HashMap<>();
     private List<AssetFile> effectiveAssetFiles;
 
-    private PackSource(Path root, FileSystem zipFileSystem,
+    private PackSource(Path configuredRoot, FileSystem zipFileSystem,
                        Path fallbackPackDirectory) throws IOException {
-        this.root = root;
         this.zipFileSystem = zipFileSystem;
+        this.root = discoverPackRoot(configuredRoot);
         this.fallbackPackDirectory = fallbackPackDirectory == null ? null
-                : fallbackPackDirectory.toAbsolutePath().normalize();
-        this.metadata = JavaPackMetadata.read(root);
-        List<Path> roots = new java.util.ArrayList<>();
-        Path baseAssets = root.resolve("assets");
+                : discoverPackRoot(fallbackPackDirectory.toAbsolutePath().normalize());
+
+        JavaPackMetadata primaryMetadata = JavaPackMetadata.read(root);
+        JavaPackMetadata fallbackMetadata = this.fallbackPackDirectory == null
+                ? new JavaPackMetadata(null, null, null, List.of())
+                : JavaPackMetadata.read(this.fallbackPackDirectory);
+        this.metadata = hasMetadata(primaryMetadata)
+                ? primaryMetadata : fallbackMetadata;
+        this.primaryAssetRoots = assetRoots(root, primaryMetadata);
+        this.fallbackAssetRoots = this.fallbackPackDirectory == null
+                || samePath(root, this.fallbackPackDirectory)
+                ? List.of()
+                : assetRoots(this.fallbackPackDirectory, fallbackMetadata);
+        List<Path> roots = new ArrayList<>(fallbackAssetRoots);
+        roots.addAll(primaryAssetRoots);
+        this.assetRoots = List.copyOf(roots);
+    }
+
+    private static List<Path> assetRoots(Path packRoot,
+                                         JavaPackMetadata metadata) {
+        List<Path> roots = new ArrayList<>();
+        Path baseAssets = packRoot.resolve("assets");
         if (Files.isDirectory(baseAssets)) roots.add(baseAssets);
         for (JavaPackMetadata.Overlay overlay : metadata.activeOverlays()) {
             String directory = overlay.directory().replace('\\', '/');
             if (directory.startsWith("/") || java.util.Arrays.asList(directory.split("/"))
                     .contains("..")) continue;
-            Path assets = root.resolve(directory).resolve("assets").normalize();
-            if (assets.startsWith(root) && Files.isDirectory(assets)) roots.add(assets);
+            Path assets = packRoot.resolve(directory).resolve("assets").normalize();
+            if (assets.startsWith(packRoot) && Files.isDirectory(assets)) roots.add(assets);
         }
-        this.assetRoots = List.copyOf(roots);
+        return List.copyOf(roots);
     }
 
     public static PackSource open(Path configured) throws IOException {
@@ -72,6 +100,18 @@ public final class PackSource implements AutoCloseable {
         return metadata;
     }
 
+    public Path findPackFile(String relative) {
+        if (unsafeRelative(relative)) return null;
+        Path primary = root.resolve(relative).normalize();
+        if (primary.startsWith(root) && Files.isRegularFile(primary)) return primary;
+        if (fallbackPackDirectory == null) return null;
+        Path fallback = fallbackPackDirectory.resolve(relative).normalize();
+        if (!fallback.startsWith(fallbackPackDirectory)
+                || !Files.isRegularFile(fallback)) return null;
+        fallbackAssets.add(normalizedPath(fallback));
+        return fallback;
+    }
+
     /** Base assets first, followed by overlays in declaration order. */
     public List<Path> assetRoots() {
         return assetRoots;
@@ -80,13 +120,27 @@ public final class PackSource implements AutoCloseable {
     /** Finds an asset with the last declared overlay taking precedence. */
     public Path findAsset(String namespace, String relative) {
         if (!validNamespace(namespace) || unsafeRelative(relative)) return null;
-        for (int i = assetRoots.size() - 1; i >= 0; i--) {
-            Path namespaceRoot = assetRoots.get(i).resolve(namespace).normalize();
+        Path primary = findInAssetRoots(primaryAssetRoots, namespace, relative);
+        if (primary != null) return primary;
+        primary = findFlatAsset(root, namespace, relative);
+        if (primary != null) return primary;
+        Path fallback = findInAssetRoots(fallbackAssetRoots, namespace, relative);
+        if (fallback != null) {
+            fallbackAssets.add(normalizedPath(fallback));
+            return fallback;
+        }
+        return findFallbackAsset(namespace, relative);
+    }
+
+    private Path findInAssetRoots(List<Path> roots, String namespace,
+                                  String relative) {
+        for (int i = roots.size() - 1; i >= 0; i--) {
+            Path namespaceRoot = roots.get(i).resolve(namespace).normalize();
             Path candidate = namespaceRoot.resolve(relative).normalize();
             if (!candidate.startsWith(namespaceRoot)) continue;
             if (Files.isRegularFile(candidate)) return candidate;
         }
-        return findFallbackAsset(namespace, relative);
+        return null;
     }
 
     public int fallbackAssetCount() {
@@ -96,24 +150,28 @@ public final class PackSource implements AutoCloseable {
     private Path findFallbackAsset(String namespace, String relative) {
         if (fallbackPackDirectory == null
                 || !Files.isDirectory(fallbackPackDirectory)) return null;
-        List<Path> candidates = new ArrayList<>();
-        Path namespacedRoot = fallbackPackDirectory.resolve("assets")
-                .resolve(namespace).normalize();
-        candidates.add(namespacedRoot.resolve(relative).normalize());
-        // Oraxen treats pack/models, pack/textures, pack/sounds and pack/font
-        // as the flat source form of assets/oraxen/* in the generated ZIP.
-        if (namespace.equals("oraxen"))
-            candidates.add(fallbackPackDirectory.resolve(relative).normalize());
-        for (Path candidate : candidates) {
-            boolean insideNamespaced = candidate.startsWith(namespacedRoot);
-            boolean insideFlat = namespace.equals("oraxen")
-                    && candidate.startsWith(fallbackPackDirectory);
-            if (!(insideNamespaced || insideFlat)
-                    || !Files.isRegularFile(candidate)) continue;
-            fallbackAssets.add(namespace + ':' + relative);
+        // Current Oraxen maps its flat pack/models, pack/textures, pack/font,
+        // pack/lang and pack/sounds folders into assets/minecraft. Older
+        // configurations commonly referenced the same files as oraxen assets,
+        // so both namespaces are accepted for exact fallback lookups.
+        Path candidate = findFlatAsset(
+                fallbackPackDirectory, namespace, relative);
+        if (candidate != null) {
+            fallbackAssets.add(normalizedPath(candidate));
             return candidate;
         }
         return null;
+    }
+
+    private Path findFlatAsset(Path packRoot, String namespace,
+                               String relative) {
+        if (!(namespace.equals("minecraft") || namespace.equals("oraxen")))
+            return null;
+        Path candidate = packRoot.resolve(relative).normalize();
+        if (!candidate.startsWith(packRoot) || !Files.isRegularFile(candidate))
+            return null;
+        String first = relative.replace('\\', '/').split("/", 2)[0];
+        return FLAT_ASSET_DIRECTORIES.contains(first) ? candidate : null;
     }
 
     /**
@@ -124,27 +182,62 @@ public final class PackSource implements AutoCloseable {
     public List<AssetFile> effectiveAssetFiles() throws IOException {
         if (effectiveAssetFiles != null) return effectiveAssetFiles;
         Map<String, AssetFile> effective = new LinkedHashMap<>();
-        for (Path assetRoot : assetRoots) {
-            if (!Files.isDirectory(assetRoot)) continue;
-            try (Stream<Path> namespaces = Files.list(assetRoot)) {
-                for (Path namespaceRoot : namespaces.filter(Files::isDirectory)
+        if (fallbackPackDirectory != null
+                && !samePath(root, fallbackPackDirectory))
+            collectFlatAssets(fallbackPackDirectory, effective, true);
+        for (Path assetRoot : fallbackAssetRoots)
+            collectAssetRoot(assetRoot, effective, true);
+        collectFlatAssets(root, effective, false);
+        for (Path assetRoot : primaryAssetRoots)
+            collectAssetRoot(assetRoot, effective, false);
+        effective.values().stream().filter(AssetFile::fallback)
+                .map(AssetFile::path).map(PackSource::normalizedPath)
+                .forEach(fallbackAssets::add);
+        effectiveAssetFiles = List.copyOf(effective.values());
+        return effectiveAssetFiles;
+    }
+
+    private void collectFlatAssets(Path packRoot,
+            Map<String, AssetFile> effective, boolean fallback)
+            throws IOException {
+        if (!Files.isDirectory(packRoot)) return;
+        for (String directory : FLAT_ASSET_DIRECTORIES) {
+            Path flatRoot = packRoot.resolve(directory);
+            if (!Files.isDirectory(flatRoot)) continue;
+            try (Stream<Path> paths = Files.walk(flatRoot)) {
+                for (Path file : paths.filter(Files::isRegularFile)
                         .sorted().toList()) {
-                    String namespace = namespaceRoot.getFileName().toString();
-                    if (!validNamespace(namespace)) continue;
-                    try (Stream<Path> paths = Files.walk(namespaceRoot)) {
-                        for (Path file : paths.filter(Files::isRegularFile)
-                                .sorted().toList()) {
-                            String relative = namespaceRoot.relativize(file).toString()
-                                    .replace('\\', '/');
-                            effective.put(namespace + '\0' + relative,
-                                    new AssetFile(namespace, relative, file));
-                        }
+                    String relative = directory + "/" + flatRoot.relativize(file)
+                            .toString().replace('\\', '/');
+                    String key = "minecraft\0" + relative;
+                    effective.put(key,
+                            new AssetFile("minecraft", relative, file, fallback));
+                }
+            }
+        }
+    }
+
+    private void collectAssetRoot(Path assetRoot,
+                                  Map<String, AssetFile> effective,
+                                  boolean fallback) throws IOException {
+        if (!Files.isDirectory(assetRoot)) return;
+        try (Stream<Path> namespaces = Files.list(assetRoot)) {
+            for (Path namespaceRoot : namespaces.filter(Files::isDirectory)
+                    .sorted().toList()) {
+                String namespace = namespaceRoot.getFileName().toString();
+                if (!validNamespace(namespace)) continue;
+                try (Stream<Path> paths = Files.walk(namespaceRoot)) {
+                    for (Path file : paths.filter(Files::isRegularFile)
+                            .sorted().toList()) {
+                        String relative = namespaceRoot.relativize(file).toString()
+                                .replace('\\', '/');
+                        String key = namespace + '\0' + relative;
+                        effective.put(key,
+                                new AssetFile(namespace, relative, file, fallback));
                     }
                 }
             }
         }
-        effectiveAssetFiles = List.copyOf(effective.values());
-        return effectiveAssetFiles;
     }
 
     public Path findTexture(String reference) throws IOException {
@@ -215,36 +308,14 @@ public final class PackSource implements AutoCloseable {
 
     private Map<String, Optional<Path>> buildBasenameIndex(String namespace)
             throws IOException {
-        Map<String, List<Path>> effective = new LinkedHashMap<>();
-        for (Path assetRoot : assetRoots) {
-            Path namespaceRoot = assetRoot.resolve(namespace).normalize();
-            if (!namespaceRoot.startsWith(assetRoot) || !Files.isDirectory(namespaceRoot))
-                continue;
-
-            Map<String, List<Path>> layer = new LinkedHashMap<>();
-            try (Stream<Path> paths = Files.walk(namespaceRoot)) {
-                for (Path candidate : paths.filter(Files::isRegularFile)
-                        .filter(path -> path.getFileName().toString()
-                                .toLowerCase(Locale.ROOT).endsWith(".png"))
-                        .sorted()
-                        .toList()) {
-                    String relative = namespaceRoot.relativize(candidate).toString()
-                            .replace('\\', '/').toLowerCase(Locale.ROOT);
-                    layer.computeIfAbsent(relative, ignored -> new ArrayList<>())
-                            .add(candidate);
-                }
-            }
-            // Applying one overlay replaces the previous resource at the same
-            // logical path, including any case-colliding invalid candidates.
-            layer.forEach(effective::put);
-        }
-
         Map<String, List<Path>> byBasename = new LinkedHashMap<>();
-        for (List<Path> candidates : effective.values()) {
-            for (Path candidate : candidates)
-                byBasename.computeIfAbsent(
-                        candidate.getFileName().toString().toLowerCase(Locale.ROOT),
-                        ignored -> new ArrayList<>()).add(candidate);
+        for (AssetFile asset : effectiveAssetFiles()) {
+            if (!asset.namespace().equals(namespace)
+                    || !asset.path().getFileName().toString()
+                    .toLowerCase(Locale.ROOT).endsWith(".png")) continue;
+            byBasename.computeIfAbsent(
+                    asset.path().getFileName().toString().toLowerCase(Locale.ROOT),
+                    ignored -> new ArrayList<>()).add(asset.path());
         }
         Map<String, Optional<Path>> result = new HashMap<>();
         byBasename.forEach((name, candidates) -> result.put(name,
@@ -269,5 +340,62 @@ public final class PackSource implements AutoCloseable {
     private static boolean unsafeRelative(String value) {
         if (value == null || value.isBlank() || value.startsWith("/")) return true;
         return java.util.Arrays.stream(value.split("/")).anyMatch(".."::equals);
+    }
+
+    private static boolean hasMetadata(JavaPackMetadata metadata) {
+        return metadata.packFormat() != null || metadata.minFormat() != null
+                || metadata.maxFormat() != null || !metadata.overlays().isEmpty();
+    }
+
+    private static boolean samePath(Path left, Path right) {
+        return left.toAbsolutePath().normalize()
+                .equals(right.toAbsolutePath().normalize());
+    }
+
+    private static Path normalizedPath(Path path) {
+        return path.toAbsolutePath().normalize();
+    }
+
+    /**
+     * ZIP tools often wrap a resource pack in one top-level directory. Locate
+     * that sole pack root instead of silently treating the archive as empty.
+     */
+    private static Path discoverPackRoot(Path startingRoot) throws IOException {
+        Path normalized = startingRoot.toAbsolutePath().normalize();
+        if (!Files.isDirectory(normalized) || looksLikePackRoot(normalized))
+            return normalized;
+
+        List<Path> metadataRoots;
+        try (Stream<Path> paths = Files.walk(normalized)) {
+            metadataRoots = paths.filter(Files::isDirectory)
+                    .filter(path -> !path.equals(normalized))
+                    .filter(path -> Files.isRegularFile(path.resolve("pack.mcmeta")))
+                    .sorted(Comparator.comparingInt(path ->
+                            normalized.relativize(path).getNameCount()))
+                    .toList();
+        }
+        if (metadataRoots.size() == 1) return metadataRoots.get(0);
+
+        List<Path> contentRoots;
+        try (Stream<Path> paths = Files.walk(normalized)) {
+            contentRoots = paths.filter(Files::isDirectory)
+                    .filter(path -> !path.equals(normalized))
+                    .filter(PackSource::looksLikePackRoot)
+                    .sorted(Comparator.comparingInt(path ->
+                            normalized.relativize(path).getNameCount()))
+                    .toList();
+        }
+        List<Path> topLevelRoots = contentRoots.stream()
+                .filter(candidate -> contentRoots.stream().noneMatch(other ->
+                        !other.equals(candidate) && candidate.startsWith(other)))
+                .toList();
+        return topLevelRoots.size() == 1 ? topLevelRoots.get(0) : normalized;
+    }
+
+    private static boolean looksLikePackRoot(Path path) {
+        return Files.isRegularFile(path.resolve("pack.mcmeta"))
+                || Files.isDirectory(path.resolve("assets"))
+                || FLAT_ASSET_DIRECTORIES.stream()
+                .anyMatch(directory -> Files.isDirectory(path.resolve(directory)));
     }
 }

@@ -44,6 +44,102 @@ class PackConverterTest {
     }
 
     @Test
+    void refusesToReplaceAnInstalledPackWhenTheJavaPackHasNoAssets()
+            throws Exception {
+        Path oraxen = temp.resolve("plugins/Oraxen");
+        Files.createDirectories(oraxen.resolve("items"));
+        Path javaPack = oraxen.resolve("pack/pack.zip");
+        Files.createDirectories(javaPack.getParent());
+        try (ZipOutputStream zip = new ZipOutputStream(
+                Files.newOutputStream(javaPack))) {
+            entry(zip, "pack.mcmeta", """
+                    {"pack":{"pack_format":75,"description":"empty"}}
+                    """.getBytes(StandardCharsets.UTF_8));
+        }
+
+        Path geyser = temp.resolve("plugins/Geyser-Spigot");
+        Path installed = geyser.resolve("packs/OraxenBedrock.mcpack");
+        Files.createDirectories(installed.getParent());
+        Files.writeString(installed, "known-good-pack");
+        BridgeConfig config = new BridgeConfig(
+                temp, oraxen, geyser, javaPack, "Test", "Test pack", "oraxen",
+                new int[]{1, 0, 0}, true, true, true, true, true, true, true,
+                false, false, 100, false);
+
+        IOException error = assertThrows(IOException.class, () ->
+                new PackConverter(temp.resolve("plugins/OraxenBedrock"))
+                        .convert(config));
+
+        assertTrue(error.getMessage().contains("contains no assets"));
+        assertEquals("known-good-pack", Files.readString(installed));
+    }
+
+    @Test
+    void keepsInstalledPackWhenFontsExistButAllCustomItemsFail() throws Exception {
+        Path oraxen = temp.resolve("plugins/Oraxen");
+        Files.createDirectories(oraxen.resolve("items"));
+        Files.writeString(oraxen.resolve("items/broken.yml"), """
+                broken_item:
+                  material: PAPER
+                  Pack:
+                    model: item/missing
+                    textures: [item/missing]
+                """);
+        Path javaPack = oraxen.resolve("pack");
+        Path fonts = javaPack.resolve("assets/oraxen/font");
+        Path textures = javaPack.resolve("assets/oraxen/textures/font");
+        Files.createDirectories(fonts);
+        Files.createDirectories(textures);
+        Files.writeString(fonts.resolve("default.json"), """
+                {"providers":[{"type":"bitmap","file":"oraxen:font/emoji.png",
+                  "height":8,"ascent":8,"chars":["\uE100"]}]}
+                """);
+        Files.write(textures.resolve("emoji.png"), png(8, 8, 0xFFFFFFFF));
+
+        Path geyser = temp.resolve("plugins/Geyser-Spigot");
+        Path installed = geyser.resolve("packs/OraxenBedrock.mcpack");
+        Files.createDirectories(installed.getParent());
+        Files.writeString(installed, "known-good-pack");
+        BridgeConfig config = new BridgeConfig(
+                temp, oraxen, geyser, javaPack, "Test", "Test pack", "oraxen",
+                new int[]{1, 0, 0}, true, false, false, false, true, false, false,
+                false, false, 100, false);
+
+        IOException error = assertThrows(IOException.class, () ->
+                new PackConverter(temp.resolve("plugins/OraxenBedrock"))
+                        .convert(config));
+        assertTrue(error.getMessage().contains("No custom Oraxen item"));
+        assertEquals("known-good-pack", Files.readString(installed));
+    }
+
+    @Test
+    void osMetadataDoesNotMakeAnEmptyOutputInstallable() throws Exception {
+        Path oraxen = temp.resolve("plugins/Oraxen");
+        Files.createDirectories(oraxen.resolve("items"));
+        Path javaPack = oraxen.resolve("pack");
+        Path models = javaPack.resolve("assets/oraxen/models/item");
+        Files.createDirectories(models);
+        Files.writeString(models.resolve("unused.json"), "{}");
+
+        Path data = temp.resolve("plugins/OraxenBedrock");
+        Files.createDirectories(data.resolve("overrides"));
+        Files.writeString(data.resolve("overrides/.DS_Store"), "metadata");
+        Path geyser = temp.resolve("plugins/Geyser-Spigot");
+        Path installed = geyser.resolve("packs/OraxenBedrock.mcpack");
+        Files.createDirectories(installed.getParent());
+        Files.writeString(installed, "known-good-pack");
+        BridgeConfig config = new BridgeConfig(
+                temp, oraxen, geyser, javaPack, "Test", "Test pack", "oraxen",
+                new int[]{1, 0, 0}, false, false, false, false, false, false, true,
+                false, false, 100, false);
+
+        IOException error = assertThrows(IOException.class,
+                () -> new PackConverter(data).convert(config));
+        assertTrue(error.getMessage().contains("no usable Bedrock assets"));
+        assertEquals("known-good-pack", Files.readString(installed));
+    }
+
+    @Test
     void convertsCurrentUnifiedBlockAppearanceSchema() throws Exception {
         Path oraxen = temp.resolve("plugins/Oraxen");
         Path items = oraxen.resolve("items");
@@ -402,14 +498,14 @@ class PackConverterTest {
                     model: block/dual_staff
                     textures: [staff_red, staff_blue]
                 """);
-        Files.writeString(oraxen.resolve("sound.yml"), """
-                settings:
-                  automatically_generate: true
+        Files.writeString(oraxen.resolve("sounds.yml"), """
                 sounds:
-                  night_song:
+                  - id: night_song
                     category: records
                     sound: music/night.ogg
                     stream: true
+                  - id: oraxen:direct_sound
+                    sound: music/direct.ogg
                 """);
 
         Path javaPack = oraxen.resolve("pack/pack.zip");
@@ -492,12 +588,13 @@ class PackConverterTest {
                     ]}
                     """.formatted(Character.toString(0xE101), Character.toString(0xE102)))
                     .getBytes(StandardCharsets.UTF_8));
-            entry(zip, "assets/oraxen/sounds.json", """
+            entry(zip, "assets/minecraft/sounds.json", """
                     {"night_song":{"sounds":[
-                      {"name":"oraxen:music/night","stream":true}
+                      {"name":"music/night","stream":true}
                     ]}}
                     """.getBytes(StandardCharsets.UTF_8));
-            entry(zip, "assets/oraxen/sounds/music/night.ogg", new byte[]{79, 103, 103, 83});
+            entry(zip, "assets/minecraft/sounds/music/night.ogg", new byte[]{79, 103, 103, 83});
+            entry(zip, "assets/minecraft/sounds/music/direct.ogg", new byte[]{79, 103, 103, 83});
         }
 
         Path geyser = temp.resolve("plugins/Geyser-Spigot");
@@ -547,7 +644,7 @@ class PackConverterTest {
                 assertEquals(0xFFFF2030, discIcon.getRGB(8, 8));
             }
             assertTrue(Files.isRegularFile(pack.getPath("/font/glyph_E1.png")));
-            assertTrue(Files.isRegularFile(pack.getPath("/sounds/oraxen/music/night.ogg")));
+            assertTrue(Files.isRegularFile(pack.getPath("/sounds/minecraft/music/night.ogg")));
             assertTrue(Files.isRegularFile(pack.getPath("/attachables/oraxen/crown.attachable.json")));
             assertTrue(Files.isRegularFile(pack.getPath("/attachables/oraxen/chair.attachable.json")));
             assertTrue(Files.isRegularFile(
@@ -667,12 +764,17 @@ class PackConverterTest {
             JsonObject sounds = JsonSupport.readObject(
                     pack.getPath("/sounds/sound_definitions.json"));
             JsonObject song = sounds.getAsJsonObject("sound_definitions")
-                    .getAsJsonObject("oraxen:night_song");
+                    .getAsJsonObject("minecraft:night_song");
             assertEquals("record", song.get("category").getAsString());
             assertTrue(song.getAsJsonArray("sounds").get(0).getAsJsonObject()
                     .get("stream").getAsBoolean());
-            assertEquals("sounds/oraxen/music/night",
+            assertEquals("sounds/minecraft/music/night",
                     song.getAsJsonArray("sounds").get(0).getAsJsonObject()
+                            .get("name").getAsString());
+            JsonObject direct = sounds.getAsJsonObject("sound_definitions")
+                    .getAsJsonObject("oraxen:direct_sound");
+            assertEquals("sounds/minecraft/music/direct",
+                    direct.getAsJsonArray("sounds").get(0).getAsJsonObject()
                             .get("name").getAsString());
 
             try (InputStream input = Files.newInputStream(pack.getPath("/font/glyph_E1.png"))) {
@@ -686,8 +788,8 @@ class PackConverterTest {
         }
 
         JsonObject report = JsonSupport.readObject(data.resolve("last-report.json"));
-        assertEquals(1, report.get("sound_events").getAsInt());
-        assertEquals(1, report.get("sound_files").getAsInt());
+        assertEquals(2, report.get("sound_events").getAsInt());
+        assertEquals(2, report.get("sound_files").getAsInt());
         assertEquals(2, report.get("glyphs_and_emojis").getAsInt());
         assertEquals(1, report.get("glyph_pages").getAsInt());
         assertEquals(8, report.get("animated_textures").getAsInt());

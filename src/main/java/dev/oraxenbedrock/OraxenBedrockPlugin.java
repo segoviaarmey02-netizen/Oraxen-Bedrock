@@ -17,10 +17,14 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.Enumeration;
 import java.util.List;
 import java.util.Locale;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExecutor, TabCompleter {
     private static final String PREFIX = ChatColor.AQUA + "[OraxenBedrock] " + ChatColor.RESET;
@@ -56,7 +60,7 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
         scheduleWatcher();
         validateEnvironment();
         if (manager.config().generateOnStartup()) {
-            if (manager.config().javaPack().toFile().isFile()) {
+            if (isJavaPackReady(manager.config().javaPack())) {
                 // This plugin is declared loadbefore Geyser-Spigot. Complete
                 // the initial installation before onEnable returns so Geyser
                 // can discover the generated mappings during its own startup.
@@ -157,17 +161,13 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
         startupProbe = getServer().getScheduler().runTaskTimer(this, () -> {
             Path pack = manager.config().javaPack();
             attempts[0]++;
-            try {
-                if (Files.isRegularFile(pack) && Files.size(pack) > 0) {
-                    startupProbe.cancel();
-                    startupProbe = null;
-                    manager.generate("Oraxen pack became ready", null, null);
-                    getLogger().warning("The first Bedrock pack was generated after Geyser startup; "
-                            + "restart the server once so Geyser loads the new mappings.");
-                    return;
-                }
-            } catch (IOException ignored) {
-                // The next probe retries while Oraxen replaces pack.zip.
+            if (isJavaPackReady(pack)) {
+                startupProbe.cancel();
+                startupProbe = null;
+                manager.generate("Oraxen pack became ready", null, null);
+                getLogger().warning("The first Bedrock pack was generated after Geyser startup; "
+                        + "restart the server once so Geyser loads the new mappings.");
+                return;
             }
             if (attempts[0] >= 600) {
                 startupProbe.cancel();
@@ -200,20 +200,87 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
 
     private void scheduleAfterOraxenPackWrite() {
         if (oraxenPackTask != null) oraxenPackTask.cancel();
-        // Oraxen fires its event immediately before it writes pack.zip. Waiting
-        // one tick guarantees that the converter opens the completed archive.
-        oraxenPackTask = getServer().getScheduler().runTaskLater(this, () -> {
-            oraxenPackTask = null;
-            boolean firstPackWasPending = startupProbe != null;
-            if (startupProbe != null) {
-                startupProbe.cancel();
-                startupProbe = null;
+        boolean firstPackWasPending = startupProbe != null;
+        if (startupProbe != null) {
+            startupProbe.cancel();
+            startupProbe = null;
+        }
+        Path pack = manager.config().javaPack();
+        long[] lastSize = {-1};
+        long[] lastModified = {-1};
+        int[] stableChecks = {0};
+        int[] attempts = {0};
+
+        // Current Oraxen fires OraxenPackGeneratedEvent before obfuscation and
+        // asynchronous ZIP writing. Wait for a readable central directory and
+        // two stable observations instead of racing the writer after one tick.
+        oraxenPackTask = getServer().getScheduler().runTaskTimer(this, () -> {
+            attempts[0]++;
+            long size = -1;
+            long modified = -1;
+            try {
+                BasicFileAttributes attributes =
+                        Files.readAttributes(pack, BasicFileAttributes.class);
+                size = attributes.size();
+                modified = attributes.lastModifiedTime().toMillis();
+            } catch (IOException ignored) {
+                // The next probe retries while Oraxen creates/replaces the ZIP.
             }
-            manager.generate("Oraxen pack generated", null, null);
-            if (firstPackWasPending)
-                getLogger().warning("The first Bedrock pack was generated after Geyser startup; "
-                        + "restart the server once so Geyser loads the new mappings.");
-        }, 1L);
+            boolean unchanged = size > 0 && size == lastSize[0]
+                    && modified == lastModified[0];
+            stableChecks[0] = unchanged && isJavaPackReady(pack)
+                    ? stableChecks[0] + 1 : 0;
+            lastSize[0] = size;
+            lastModified[0] = modified;
+            if (stableChecks[0] >= 1) {
+                oraxenPackTask.cancel();
+                oraxenPackTask = null;
+                manager.generate("Oraxen pack write completed", null, null);
+                if (firstPackWasPending)
+                    getLogger().warning("The first Bedrock pack was generated after Geyser startup; "
+                            + "restart the server once so Geyser loads the new mappings.");
+                return;
+            }
+            if (attempts[0] >= 6000) {
+                oraxenPackTask.cancel();
+                oraxenPackTask = null;
+                getLogger().severe("Oraxen did not finish a readable Java pack within 10 minutes: "
+                        + pack);
+            }
+        }, 2L, 2L);
+    }
+
+    static boolean isJavaPackReady(Path pack) {
+        if (Files.isDirectory(pack)) {
+            try (var paths = Files.walk(pack)) {
+                return paths.filter(Files::isRegularFile)
+                        .map(path -> pack.relativize(path).toString().replace('\\', '/'))
+                        .anyMatch(OraxenBedrockPlugin::isAssetEntry);
+            } catch (IOException ignored) {
+                return false;
+            }
+        }
+        if (!Files.isRegularFile(pack)) return false;
+        try (ZipFile zip = new ZipFile(pack.toFile())) {
+            Enumeration<? extends ZipEntry> entries = zip.entries();
+            while (entries.hasMoreElements()) {
+                ZipEntry entry = entries.nextElement();
+                if (!entry.isDirectory() && isAssetEntry(entry.getName())) return true;
+            }
+            return false;
+        } catch (IOException | RuntimeException ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isAssetEntry(String rawName) {
+        String name = rawName.replace('\\', '/').replaceFirst("^/+", "");
+        if (name.startsWith("assets/") || name.contains("/assets/")) return true;
+        // The uncompressed Oraxen pack directory uses the same flat folders
+        // that Oraxen later places under assets/minecraft in pack.zip.
+        return List.of("models/", "textures/", "lang/", "font/", "sounds/")
+                .stream().anyMatch(directory -> name.startsWith(directory)
+                        || name.contains("/" + directory));
     }
 
     private void ensureGeyserCustomContent() {
