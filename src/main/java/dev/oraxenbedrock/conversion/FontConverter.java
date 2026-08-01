@@ -27,13 +27,28 @@ final class FontConverter {
     record Result(int glyphs, int pages) {}
 
     private static final int MIN_CELL = 16;
+    /*
+     * Bedrock renders the usual 16px private-use glyph slot at roughly the
+     * height of normal text. That is too small for Oraxen emoji sprites.
+     * A 64px slot (a 1024x1024 page) gives 8x9 and 16x16 emoji a readable
+     * visual size on Bedrock's UI while retaining crisp nearest-neighbour
+     * pixels. Servers can lower or raise it through emoji-cell-size.
+     */
+    private static final int DEFAULT_EMOJI_CELL = 64;
     private static final int MAX_CELL = 128;
     private final PackSource source;
     private final Path bedrock;
+    private final int minEmojiCell;
 
     FontConverter(PackSource source, Path bedrock) {
+        this(source, bedrock, DEFAULT_EMOJI_CELL);
+    }
+
+    FontConverter(PackSource source, Path bedrock, int minEmojiCell) {
         this.source = source;
         this.bedrock = bedrock;
+        this.minEmojiCell = powerOfTwoCell(
+                Math.max(MIN_CELL, Math.min(MAX_CELL, minEmojiCell)));
     }
 
     Result convert(List<String> warnings) throws IOException {
@@ -62,16 +77,19 @@ final class FontConverter {
 
         int glyphCount = 0;
         for (Map.Entry<Integer, Map<Integer, Glyph>> pageEntry : pages.entrySet()) {
-            int cellSize = pageCellSize(pageEntry.getValue().values());
+            int page = pageEntry.getKey();
+            int cellSize = pageCellSize(page, pageEntry.getValue().values());
             BufferedImage sheet = new BufferedImage(cellSize * 16, cellSize * 16,
                     BufferedImage.TYPE_INT_ARGB);
             for (Map.Entry<Integer, Glyph> glyph : pageEntry.getValue().entrySet()) {
                 int index = glyph.getKey();
                 Glyph definition = glyph.getValue();
                 BufferedImage image = definition.image();
+                int visualSize = isPrivateUsePage(page)
+                        ? visualCellSize(page, definition) : cellSize;
                 Target target = fit(image.getWidth(), image.getHeight(),
                         index % 16 * cellSize, index / 16 * cellSize, cellSize,
-                        definition.height(), definition.ascent());
+                        visualSize, definition.height(), definition.ascent());
                 drawScaled(sheet, image, target);
                 glyphCount++;
             }
@@ -93,7 +111,11 @@ final class FontConverter {
                 || !provider.get("chars").isJsonArray()) return;
         Path texture = fontTexture(provider.get("file").getAsString());
         if (texture == null) {
-            warnings.add("Bitmap font texture not found: " + provider.get("file").getAsString());
+            String reference = provider.get("file").getAsString();
+            // The vanilla ASCII sheet is client-owned and normally absent
+            // from a server pack; Bedrock supplies its own base font.
+            if (!reference.equalsIgnoreCase("minecraft:font/ascii.png"))
+                warnings.add("Bitmap font texture not found: " + reference);
             return;
         }
         BufferedImage atlas;
@@ -183,26 +205,40 @@ final class FontConverter {
     }
 
     private static Target fit(int width, int height, int cellX, int cellY, int cellSize,
-                              int renderHeight, int ascent) {
-        // Bedrock glyph pages already define the visual 16px cell. Java's
-        // height describes Java text metrics; applying it again here makes
-        // common 8px Oraxen emojis render at half size on Bedrock.
-        double scale = Math.min((double) cellSize / width, (double) cellSize / height);
+                              int visualSize, int renderHeight, int ascent) {
+        double scale = Math.min((double) visualSize / width,
+                (double) visualSize / height);
         int targetWidth = Math.max(1, (int) Math.round(width * scale));
         int targetHeight = Math.max(1, (int) Math.round(height * scale));
         int x = cellX + (cellSize - targetWidth) / 2;
         int descent = Math.max(0, renderHeight - ascent);
         int scaledDescent =
-                (int) Math.round((double) descent * cellSize / renderHeight);
+                (int) Math.round((double) descent * visualSize / renderHeight);
         int y = cellY + Math.max(0, cellSize - targetHeight - scaledDescent);
         return new Target(x, y, targetWidth, targetHeight);
     }
 
-    private static int pageCellSize(Collection<Glyph> glyphs) {
+    private int pageCellSize(int page, Collection<Glyph> glyphs) {
         int required = MIN_CELL;
-        for (Glyph glyph : glyphs)
+        for (Glyph glyph : glyphs) {
             required = Math.max(required, Math.max(
                     glyph.image().getWidth(), glyph.image().getHeight()));
+            required = Math.max(required, visualCellSize(page, glyph));
+        }
+        return powerOfTwoCell(required);
+    }
+
+    private int visualCellSize(int page, Glyph glyph) {
+        if (!isPrivateUsePage(page)) return MIN_CELL;
+        int requested = Math.max(minEmojiCell, glyph.height() * 2);
+        return powerOfTwoCell(requested);
+    }
+
+    private static boolean isPrivateUsePage(int page) {
+        return page >= 0xE0 && page <= 0xF8;
+    }
+
+    private static int powerOfTwoCell(int required) {
         int size = MIN_CELL;
         while (size < required && size < MAX_CELL) size *= 2;
         return Math.min(size, MAX_CELL);

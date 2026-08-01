@@ -44,6 +44,71 @@ class PackConverterTest {
     }
 
     @Test
+    void convertsCurrentUnifiedBlockAppearanceSchema() throws Exception {
+        Path oraxen = temp.resolve("plugins/Oraxen");
+        Path items = oraxen.resolve("items");
+        Files.createDirectories(items);
+        Files.writeString(items.resolve("modern-block.yml"), """
+                modern_lamp:
+                  itemname: "Modern Lamp"
+                  material: PAPER
+                  Pack:
+                    model: item/modern_lamp
+                    textures: [item/modern_lamp]
+                  Mechanics:
+                    block:
+                      type: FULL
+                      custom-variation: 7
+                      light-dampening: 2
+                      appearance:
+                        model: blocks/modern_lamp
+                """);
+        Path javaPack = oraxen.resolve("pack/pack.zip");
+        Files.createDirectories(javaPack.getParent());
+        try (ZipOutputStream zip = new ZipOutputStream(
+                Files.newOutputStream(javaPack))) {
+            entry(zip, "pack.mcmeta", """
+                    {"pack":{"pack_format":75,"description":"Unified block"}}
+                    """.getBytes(StandardCharsets.UTF_8));
+            entry(zip, "assets/oraxen/textures/item/modern_lamp.png",
+                    png(16, 16, 0xFFFFCC33));
+            entry(zip, "assets/oraxen/textures/block/modern_lamp.png",
+                    png(16, 16, 0xFFFFEE77));
+            entry(zip, "assets/oraxen/models/item/modern_lamp.json", """
+                    {"parent":"minecraft:item/generated",
+                     "textures":{"layer0":"oraxen:item/modern_lamp"}}
+                    """.getBytes(StandardCharsets.UTF_8));
+            entry(zip, "assets/oraxen/models/blocks/modern_lamp.json", """
+                    {"parent":"minecraft:block/cube_all",
+                     "textures":{"all":"oraxen:block/modern_lamp"}}
+                    """.getBytes(StandardCharsets.UTF_8));
+            entry(zip, "assets/minecraft/blockstates/note_block.json", """
+                    {"variants":{"instrument=banjo,note=7,powered=false":
+                      {"model":"oraxen:blocks/modern_lamp"}}}
+                    """.getBytes(StandardCharsets.UTF_8));
+        }
+
+        Path geyser = temp.resolve("plugins/Geyser-Spigot");
+        BridgeConfig config = new BridgeConfig(
+                temp, oraxen, geyser, javaPack, "Test", "Test pack", "oraxen",
+                new int[]{1, 0, 0}, true, true, false, false, false, false, false,
+                false, false, 100, false);
+        ConversionResult result = new PackConverter(
+                temp.resolve("plugins/OraxenBedrock")).convert(config);
+
+        assertEquals(1, result.items());
+        assertEquals(1, result.blocks());
+        JsonObject block = JsonSupport.readObject(
+                        geyser.resolve("custom_mappings/oraxen-blocks.json"))
+                .getAsJsonObject("blocks").getAsJsonObject("minecraft:note_block")
+                .getAsJsonObject("state_overrides")
+                .getAsJsonObject("instrument=banjo,note=7,powered=false");
+        assertNotNull(block);
+        assertEquals(2, block.get("light_dampening").getAsInt());
+        assertEquals("geometry.oraxen.modern_lamp", block.get("geometry").getAsString());
+    }
+
+    @Test
     void convertsModernItemAndDiscoveredNoteBlockState() throws Exception {
         Path oraxen = temp.resolve("plugins/Oraxen");
         Path items = oraxen.resolve("items");
@@ -612,15 +677,11 @@ class PackConverterTest {
 
             try (InputStream input = Files.newInputStream(pack.getPath("/font/glyph_E1.png"))) {
                 BufferedImage page = ImageIO.read(input);
-                assertEquals(512, page.getWidth());
-                assertEquals(512, page.getHeight());
-                // A 32px source keeps its resolution; every glyph on the
-                // page uses the same 32px grid.
-                assertNotEquals(0, page.getRGB(48, 16) >>> 24);
-                // Java's 8px text metric must not shrink a Bedrock glyph to
-                // half of its Bedrock page cell.
-                assertNotEquals(0, page.getRGB(80, 4) >>> 24);
-                assertNotEquals(0, page.getRGB(80, 24) >>> 24);
+                assertEquals(1024, page.getWidth());
+                assertEquals(1024, page.getHeight());
+                // Private-use emoji use the readable 64px default grid.
+                assertNotEquals(0, page.getRGB(96, 32) >>> 24);
+                assertNotEquals(0, page.getRGB(160, 32) >>> 24);
             }
         }
 

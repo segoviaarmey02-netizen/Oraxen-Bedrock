@@ -26,8 +26,37 @@ public record BridgeConfig(
         boolean generateOnStartup,
         boolean watch,
         long debounceTicks,
-        boolean verbose
+        boolean verbose,
+        int emojiCellSize,
+        boolean autoEnableGeyserCustomContent
 ) {
+    public BridgeConfig(
+            Path serverRoot,
+            Path oraxenDirectory,
+            Path geyserDirectory,
+            Path javaPack,
+            String packName,
+            String packDescription,
+            String namespace,
+            int[] packVersion,
+            boolean convertItems,
+            boolean convertBlocks,
+            boolean copySounds,
+            boolean copyUi,
+            boolean convertGlyphs,
+            boolean convertLanguages,
+            boolean applyOverrides,
+            boolean generateOnStartup,
+            boolean watch,
+            long debounceTicks,
+            boolean verbose
+    ) {
+        this(serverRoot, oraxenDirectory, geyserDirectory, javaPack, packName,
+                packDescription, namespace, packVersion, convertItems, convertBlocks,
+                copySounds, copyUi, convertGlyphs, convertLanguages, applyOverrides,
+                generateOnStartup, watch, debounceTicks, verbose, 64, true);
+    }
+
     public static BridgeConfig load(JavaPlugin plugin) {
         FileConfiguration c = plugin.getConfig();
         Path root = plugin.getDataFolder().toPath().toAbsolutePath().getParent().getParent().normalize();
@@ -56,8 +85,17 @@ public record BridgeConfig(
                 c.getBoolean("auto-generate.on-startup", true),
                 c.getBoolean("auto-generate.watch-files", true),
                 Math.max(2, c.getLong("auto-generate.debounce-seconds", 5)) * 20L,
-                c.getBoolean("logging.verbose", false)
+                c.getBoolean("logging.verbose", false),
+                normalizeEmojiCellSize(c.getInt("conversion.emoji-cell-size", 64)),
+                c.getBoolean("integration.auto-enable-geyser-custom-content", true)
         );
+    }
+
+    private static int normalizeEmojiCellSize(int requested) {
+        int size = 16;
+        int required = Math.max(16, Math.min(128, requested));
+        while (size < required) size *= 2;
+        return size;
     }
 
     private static Path resolve(Path root, String value) {

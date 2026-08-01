@@ -1,14 +1,22 @@
 package dev.oraxenbedrock;
 
 import dev.oraxenbedrock.config.BridgeConfig;
+import dev.oraxenbedrock.config.GeyserConfigPatcher;
 import dev.oraxenbedrock.model.ConversionResult;
 import dev.oraxenbedrock.util.MinecraftVersion;
 import org.bukkit.ChatColor;
 import org.bukkit.command.*;
+import org.bukkit.event.Event;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
@@ -18,6 +26,9 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
     private static final String PREFIX = ChatColor.AQUA + "[OraxenBedrock] " + ChatColor.RESET;
     private ConversionManager manager;
     private BukkitTask watcher;
+    private BukkitTask startupProbe;
+    private BukkitTask oraxenPackTask;
+    private Listener oraxenPackListener;
 
     @Override
     public void onEnable() {
@@ -32,6 +43,7 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
         saveDefaultConfig();
         saveBundledOverrideReadme();
         manager = new ConversionManager(this, BridgeConfig.load(this));
+        ensureGeyserCustomContent();
         getLogger().info("Compatibility mode: Minecraft " + serverVersion
                 + " (supported range 1.20.5+)");
 
@@ -40,6 +52,7 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
             command.setExecutor(this);
             command.setTabCompleter(this);
         }
+        registerOraxenPackListener();
         scheduleWatcher();
         validateEnvironment();
         if (manager.config().generateOnStartup()) {
@@ -49,10 +62,9 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
                 // can discover the generated mappings during its own startup.
                 manager.generateNow("server startup");
             } else {
-                getLogger().warning("Initial conversion was delayed because the Oraxen Java pack"
-                        + " does not exist yet: " + manager.config().javaPack());
-                getServer().getScheduler().runTaskLater(this,
-                        () -> manager.generate("delayed server startup", null, null), 40L);
+                getLogger().warning("Initial conversion is waiting for Oraxen to finish its Java pack: "
+                        + manager.config().javaPack());
+                scheduleStartupProbe();
             }
         }
     }
@@ -60,6 +72,8 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
     @Override
     public void onDisable() {
         if (watcher != null) watcher.cancel();
+        if (startupProbe != null) startupProbe.cancel();
+        if (oraxenPackTask != null) oraxenPackTask.cancel();
     }
 
     @Override
@@ -79,6 +93,7 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
             case "reload" -> {
                 reloadConfig();
                 manager.setConfig(BridgeConfig.load(this));
+                ensureGeyserCustomContent();
                 scheduleWatcher();
                 sender.sendMessage(PREFIX + ChatColor.GREEN + "Configuration reloaded.");
             }
@@ -134,6 +149,88 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
         long period = manager.config().debounceTicks();
         watcher = getServer().getScheduler().runTaskTimerAsynchronously(
                 this, manager::pollForChanges, period, period);
+    }
+
+    private void scheduleStartupProbe() {
+        if (startupProbe != null) startupProbe.cancel();
+        final int[] attempts = {0};
+        startupProbe = getServer().getScheduler().runTaskTimer(this, () -> {
+            Path pack = manager.config().javaPack();
+            attempts[0]++;
+            try {
+                if (Files.isRegularFile(pack) && Files.size(pack) > 0) {
+                    startupProbe.cancel();
+                    startupProbe = null;
+                    manager.generate("Oraxen pack became ready", null, null);
+                    getLogger().warning("The first Bedrock pack was generated after Geyser startup; "
+                            + "restart the server once so Geyser loads the new mappings.");
+                    return;
+                }
+            } catch (IOException ignored) {
+                // The next probe retries while Oraxen replaces pack.zip.
+            }
+            if (attempts[0] >= 600) {
+                startupProbe.cancel();
+                startupProbe = null;
+                getLogger().severe("Oraxen did not create its Java pack within 10 minutes: " + pack);
+            }
+        }, 20L, 20L);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void registerOraxenPackListener() {
+        Plugin oraxen = getServer().getPluginManager().getPlugin("Oraxen");
+        if (oraxen == null) return;
+        try {
+            Class<?> raw = Class.forName(
+                    "io.th0rgal.oraxen.api.events.OraxenPackGeneratedEvent",
+                    false, oraxen.getClass().getClassLoader());
+            if (!Event.class.isAssignableFrom(raw)) return;
+            Class<? extends Event> eventType =
+                    (Class<? extends Event>) raw.asSubclass(Event.class);
+            oraxenPackListener = new Listener() {};
+            getServer().getPluginManager().registerEvent(
+                    eventType, oraxenPackListener, EventPriority.MONITOR,
+                    (listener, event) -> scheduleAfterOraxenPackWrite(), this);
+        } catch (ClassNotFoundException | LinkageError exception) {
+            getLogger().warning("This Oraxen version does not expose the pack-generated event; "
+                    + "file watching will be used instead.");
+        }
+    }
+
+    private void scheduleAfterOraxenPackWrite() {
+        if (oraxenPackTask != null) oraxenPackTask.cancel();
+        // Oraxen fires its event immediately before it writes pack.zip. Waiting
+        // one tick guarantees that the converter opens the completed archive.
+        oraxenPackTask = getServer().getScheduler().runTaskLater(this, () -> {
+            oraxenPackTask = null;
+            boolean firstPackWasPending = startupProbe != null;
+            if (startupProbe != null) {
+                startupProbe.cancel();
+                startupProbe = null;
+            }
+            manager.generate("Oraxen pack generated", null, null);
+            if (firstPackWasPending)
+                getLogger().warning("The first Bedrock pack was generated after Geyser startup; "
+                        + "restart the server once so Geyser loads the new mappings.");
+        }, 1L);
+    }
+
+    private void ensureGeyserCustomContent() {
+        if (!manager.config().autoEnableGeyserCustomContent()) return;
+        Path geyserConfig = manager.config().geyserDirectory().resolve("config.yml");
+        try {
+            GeyserConfigPatcher.Result result =
+                    GeyserConfigPatcher.enable(geyserConfig);
+            if (result == GeyserConfigPatcher.Result.UPDATED)
+                getLogger().info("Enabled gameplay.enable-custom-content in " + geyserConfig);
+            else if (result == GeyserConfigPatcher.Result.CONFIG_MISSING)
+                getLogger().warning("Geyser config does not exist yet; after its first start, "
+                        + "make sure gameplay.enable-custom-content is true: " + geyserConfig);
+        } catch (IOException exception) {
+            getLogger().severe("Could not enable Geyser custom content in "
+                    + geyserConfig + ": " + exception.getMessage());
+        }
     }
 
     private void validateEnvironment() {

@@ -26,6 +26,18 @@ discovered across every namespace in Oraxen's generated
 `assets/*/blockstates/*.json`, avoiding fragile hard-coded
 `custom_variation` calculations.
 
+When Oraxen resource-key obfuscation or a version overlay removes the logical
+model path from the generated ZIP, lookup falls back to the uncompressed
+`plugins/Oraxen/pack/models` and `pack/textures` sources. Open-ended metadata
+ranges such as `min_format: 46` / `max_format: 999` use the minimum format as
+their baseline overlay instead of incorrectly selecting the future sentinel.
+
+Current unified Oraxen block declarations are supported too, including
+`Mechanics.block.type`, nested `appearance.model`, hyphenated setting names,
+and the related models generated for stairs, slabs, doors, trapdoors, grates,
+and bulbs. Legacy `noteblock`, `stringblock`, `chorusblock`, and shaped-block
+sections remain compatible.
+
 Modern Java 1.21.4+ item definitions from `assets/*/items/*.json` are resolved,
 including model, composite, condition, select and range-dispatch nodes.
 Their alternate visual states become additional Geyser mappings instead of
@@ -82,6 +94,13 @@ pages. This covers Oraxen emoji and other BMP private-use glyphs in chat,
 names, lore, scoreboards, and menus. Bedrock has no glyph page for
 supplementary code points above `U+FFFF`; those are reported rather than
 silently producing a broken font.
+
+Private-use emoji pages use a configurable 64 px minimum cell (1024×1024
+page) by default. Small 8×9 and 16×16 pixel-art emoji are enlarged with
+nearest-neighbour sampling, while declared 32/64/128 px sizes and
+high-resolution sources are kept on appropriately larger page grids without
+blurring. Set `conversion.emoji-cell-size` to `32`, `64`, or `128` to tune
+the visual size for a specific Bedrock UI scale.
 
 Animated Java textures with a sibling `texture.png.mcmeta` are converted too:
 
@@ -179,12 +198,21 @@ Requires JDK 21+ and Maven:
 mvn clean package
 ```
 
-Install `target/OraxenBedrock-2.6.5.jar` alongside Oraxen and Geyser, set
-`gameplay.enable-custom-content: true` in Geyser, then restart the server.
+Install `target/OraxenBedrock-2.7.1.jar` alongside Oraxen and Geyser, then
+restart the server. By default the bridge enables
+`gameplay.enable-custom-content: true` in an existing Geyser config before
+Geyser starts; this can be disabled with
+`integration.auto-enable-geyser-custom-content`.
 The declared plugin initialization order is Oraxen, OraxenBedrock, then
 Geyser-Spigot. When Oraxen's Java pack already exists, the initial conversion
 is completed before Geyser-Spigot enables so it can discover the mappings on
-the same server start.
+the same server start. Later Oraxen pack generations are detected from
+`OraxenPackGeneratedEvent` after the archive has been fully written, with file
+watching as a fallback. Geyser itself still requires a restart to load mapping
+files changed while it is already running. On a completely fresh installation
+where Oraxen creates its first `pack.zip` after Geyser startup, the bridge
+generates the Bedrock files automatically and logs that one additional restart
+is required.
 
 Commands:
 

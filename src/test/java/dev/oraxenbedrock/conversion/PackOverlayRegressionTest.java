@@ -55,6 +55,37 @@ class PackOverlayRegressionTest {
     }
 
     @Test
+    void openEndedFormatRangeUsesItsMinimumAsTheOverlayBaseline()
+            throws Exception {
+        write(temp.resolve("pack.mcmeta"), """
+                {
+                  "min_format":[46,0],
+                  "max_format":[999,0],
+                  "pack":{"description":"Open-ended Oraxen pack"},
+                  "overlays":{"entries":[
+                    {"formats":{"min_inclusive":46,"max_inclusive":83},
+                     "directory":"baseline"},
+                    {"formats":{"min_inclusive":84,"max_inclusive":999},
+                     "directory":"future"}
+                  ]}
+                }
+                """);
+        write(temp.resolve("assets/oraxen/models/default/table.json"), "base");
+        write(temp.resolve(
+                "baseline/assets/oraxen/models/default/table.json"), "baseline");
+        write(temp.resolve(
+                "future/assets/oraxen/models/default/table.json"), "future");
+
+        try (PackSource source = PackSource.open(temp)) {
+            assertEquals(46, source.metadata().minFormat());
+            assertEquals(999, source.metadata().maxFormat());
+            assertEquals(1, source.metadata().activeOverlays().size());
+            assertEquals("baseline", Files.readString(source.findAsset(
+                    "oraxen", "models/default/table.json")));
+        }
+    }
+
+    @Test
     void validatorAcceptsDefaultExpectedValueForConditionPredicate()
             throws Exception {
         Path bedrock = temp.resolve("validator");

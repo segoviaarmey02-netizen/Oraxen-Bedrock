@@ -40,6 +40,14 @@ public record OraxenItem(
     }
 
     private boolean hasMechanic(String name) {
-        return mechanics.keySet().stream().anyMatch(name::equalsIgnoreCase);
+        String expected = normalizeMechanic(name);
+        return mechanics.keySet().stream()
+                .map(OraxenItem::normalizeMechanic)
+                .anyMatch(expected::equals);
+    }
+
+    private static String normalizeMechanic(String name) {
+        return name.toLowerCase(java.util.Locale.ROOT)
+                .replace("_", "").replace("-", "");
     }
 }

@@ -144,7 +144,11 @@ final class SoundConverter {
                 .replaceFirst("\\.(ogg|wav)$", "");
         Path audio = findAudio(namespace, clean);
         if (audio == null) {
-            warnings.add("Sound file not found for '" + rawName + "'");
+            // Vanilla registries reference client-owned audio that is
+            // intentionally absent from server packs. Only missing custom
+            // audio is actionable here.
+            if (!namespace.equals("minecraft"))
+                warnings.add("Sound file not found for '" + rawName + "'");
             return null;
         }
         String extension = extension(audio);

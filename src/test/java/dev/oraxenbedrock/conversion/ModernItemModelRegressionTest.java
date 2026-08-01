@@ -932,6 +932,80 @@ class ModernItemModelRegressionTest {
         }
     }
 
+    @Test
+    void recoversLogicalModelsAndTexturesFromTheOraxenSourcePack()
+            throws Exception {
+        Path oraxen = temp.resolve("plugins/Oraxen");
+        write(oraxen.resolve("items/source-fallback.yml"), """
+                table:
+                  displayname: "Table"
+                  material: PAPER
+                  Pack:
+                    model: default/table
+                  Components:
+                    item_model: oraxen:table
+                  Mechanics:
+                    furniture:
+                      type: DISPLAY_ENTITY
+                arrow_next_icon:
+                  displayname: "Next"
+                  material: PAPER
+                  Pack:
+                    generate_model: true
+                    textures: [icons/arrow_next]
+                  Components:
+                    item_model: oraxen:arrow_next_icon
+                """);
+        write(oraxen.resolve("pack/models/default/table.json"), """
+                {"textures":{"all":"oraxen:default/table"},
+                 "elements":[{"from":[0,0,0],"to":[16,8,16],
+                   "faces":{"north":{"texture":"#all"}}}]}
+                """);
+        writePng(oraxen.resolve("pack/textures/default/table.png"),
+                0xFF8B5A2B);
+        writePng(oraxen.resolve("pack/textures/icons/arrow_next.png"),
+                0xFFFFFFFF);
+
+        Path javaPack = temp.resolve("generated-obfuscated-pack");
+        write(javaPack.resolve("pack.mcmeta"), """
+                {"min_format":[46,0],"max_format":[999,0],
+                 "pack":{"description":"Logical source fallback"}}
+                """);
+        write(javaPack.resolve("assets/oraxen/items/table.json"), """
+                {"model":{"type":"minecraft:model",
+                  "model":"oraxen:default/table"}}
+                """);
+        write(javaPack.resolve(
+                "assets/oraxen/items/arrow_next_icon.json"), """
+                {"model":{"type":"minecraft:model",
+                  "model":"oraxen:arrow_next_icon"}}
+                """);
+
+        Path data = temp.resolve("plugins/OraxenBedrock");
+        BridgeConfig config = new BridgeConfig(
+                temp, oraxen, temp.resolve("plugins/Geyser-Spigot"),
+                javaPack, "Test", "Test pack", "oraxen",
+                new int[]{1, 17, 0},
+                true, false, false, false, false, false, false,
+                false, false, 100, false);
+
+        ConversionResult result = new PackConverter(data).convert(config);
+        assertEquals(2, result.items());
+        assertFalse(result.warnings().stream().anyMatch(warning ->
+                warning.contains("Skipped custom mapping")));
+        assertTrue(result.warnings().stream().anyMatch(warning ->
+                warning.contains("Recovered")
+                        && warning.contains("Oraxen pack source")));
+        try (FileSystem pack = FileSystems.newFileSystem(result.pack())) {
+            assertTrue(Files.isRegularFile(pack.getPath(
+                    "/models/oraxen/table.geo.json")));
+            assertTrue(Files.isRegularFile(pack.getPath(
+                    "/textures/items/table.png")));
+            assertTrue(Files.isRegularFile(pack.getPath(
+                    "/textures/items/arrow_next_icon.png")));
+        }
+    }
+
     private Path resourcePack(Map<String, String> definitions) throws IOException {
         Path pack = temp.resolve("resolver-pack");
         write(pack.resolve("pack.mcmeta"), """

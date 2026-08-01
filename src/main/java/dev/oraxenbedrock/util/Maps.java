@@ -18,7 +18,16 @@ public final class Maps {
         for (Map.Entry<?, ?> entry : map.entrySet()) {
             if (String.valueOf(entry.getKey()).equalsIgnoreCase(key)) return entry.getValue();
         }
+        String normalized = normalizeKey(key);
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            if (normalizeKey(String.valueOf(entry.getKey())).equals(normalized))
+                return entry.getValue();
+        }
         return null;
+    }
+
+    private static String normalizeKey(String key) {
+        return key.toLowerCase(Locale.ROOT).replace("-", "_");
     }
 
     public static String string(Map<?, ?> map, String key) {

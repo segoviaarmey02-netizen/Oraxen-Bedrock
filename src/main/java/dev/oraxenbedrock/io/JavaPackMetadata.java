@@ -73,6 +73,7 @@ public record JavaPackMetadata(Integer packFormat, Integer minFormat,
 
     public List<Overlay> activeOverlays() {
         int target = packFormat != null ? packFormat
+                : minFormat != null ? minFormat
                 : maxFormat != null ? maxFormat : Integer.MAX_VALUE;
         return overlays.stream().filter(overlay -> overlay.appliesTo(target)).toList();
     }

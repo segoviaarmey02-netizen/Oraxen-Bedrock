@@ -44,7 +44,8 @@ public final class PackConverter {
         int copiedTextures = 0;
         int blockCount = 0;
         int mappedItemCount = 0;
-        try (PackSource source = PackSource.open(config.javaPack())) {
+        try (PackSource source = PackSource.open(config.javaPack(),
+                config.oraxenDirectory().resolve("pack"))) {
             JavaPackMetadata javaPackMetadata = source.metadata();
             if (javaPackMetadata.predatesSupportedRange())
                 warnings.add("Java resource pack format " + javaPackMetadata.description()
@@ -96,6 +97,7 @@ public final class PackConverter {
                 JavaItemModelResolver.Result modern =
                         itemModelResolver.resolve(itemModelReference);
                 boolean modernDefinitionFound = modern.definitionFound();
+                boolean ambiguousMaterialAppearance = false;
                 String mappingModelReference = normalizeModel(
                         item.itemModel(), ORAXEN_NAMESPACE + ":" + item.id());
                 List<JsonObject> baseDefinitionPredicates = List.of();
@@ -142,6 +144,7 @@ public final class PackConverter {
                                     + "from an obfuscated generated model by matching "
                                     + "its source texture");
                         } else if (textureMatches.size() > 1) {
+                            ambiguousMaterialAppearance = true;
                             warnings.add("Item '" + item.id()
                                     + "' matches multiple obfuscated model_data_float "
                                     + "entries by texture; no numeric predicate was "
@@ -243,7 +246,11 @@ public final class PackConverter {
                         && !convertedModel.materials().isEmpty())
                     texture = convertedModel.materials().values().iterator().next().source();
 
-                if (config.convertItems()) {
+                if (config.convertItems() && ambiguousMaterialAppearance)
+                    warnings.add("Skipped custom mapping for item '" + item.id()
+                            + "' because its generated custom_model_data selector "
+                            + "is ambiguous");
+                if (config.convertItems() && !ambiguousMaterialAppearance) {
                     JsonObject definition = new JsonObject();
                     boolean legacy = item.customModelData() != null
                             && (item.excludeFromItemModel()
@@ -540,7 +547,8 @@ public final class PackConverter {
                 soundFileCount = sounds.files();
             }
             if (config.convertGlyphs()) {
-                FontConverter.Result fonts = new FontConverter(source, bedrock).convert(warnings);
+                FontConverter.Result fonts = new FontConverter(
+                        source, bedrock, config.emojiCellSize()).convert(warnings);
                 glyphCount = fonts.glyphs();
                 glyphPageCount = fonts.pages();
             }
@@ -565,6 +573,10 @@ public final class PackConverter {
                     new PackValidator().validate(
                             bedrock, itemMappings, blockMappings, config.namespace());
             warnings.addAll(validation.warnings());
+            if (source.fallbackAssetCount() > 0)
+                warnings.add("Recovered " + source.fallbackAssetCount()
+                        + " model/texture references from the uncompressed "
+                        + "Oraxen pack source");
             copiedTextures = countPngFiles(bedrock);
 
             Path localPack = generated.resolve("OraxenBedrock.mcpack");
@@ -576,14 +588,18 @@ public final class PackConverter {
             atomicInstall(generated.resolve("oraxen-items.json"), itemTarget);
             atomicInstall(generated.resolve("oraxen-blocks.json"), blockTarget);
 
+            List<String> uniqueWarnings = List.copyOf(
+                    new LinkedHashSet<>(warnings));
+
             writeReport(config, items.size(), mappedItemCount, blockCount,
                     copiedTextures, geometryCount,
                     equipmentCount, soundEventCount, soundFileCount, glyphCount,
                     glyphPageCount, languageCount, languageEntryCount,
                     animationConverter.installedAnimations(), validation.checkedReferences(),
-                    effectivePackVersion, javaPackMetadata, warnings, packTarget);
+                    effectivePackVersion, javaPackMetadata,
+                    uniqueWarnings, packTarget);
             return new ConversionResult(Instant.now(), mappedItemCount, blockCount, copiedTextures,
-                    packTarget, itemTarget, List.copyOf(warnings));
+                    packTarget, itemTarget, uniqueWarnings);
         } finally {
             deleteTree(work);
         }
@@ -872,8 +888,14 @@ public final class PackConverter {
 
     private List<BlockVariant> findStringBlockStates(
             OraxenItem item, Map<String, List<BlockVariant>> states) {
-        Map<String, Object> mechanic =
-                Maps.section(item.mechanics(), "stringblock");
+        Map<String, Object> mechanic = mechanicSection(item, "stringblock");
+        if (mechanic.isEmpty()) {
+            Map<String, Object> unified = mechanicSection(item, "block");
+            String type = Maps.string(unified, "type");
+            if (type != null && (type.equalsIgnoreCase("string")
+                    || type.equalsIgnoreCase("stringblock")))
+                mechanic = unified;
+        }
         Integer baseVariation = Maps.integer(mechanic, "custom_variation");
         if (baseVariation == null || baseVariation < 1 || baseVariation > 127)
             return List.of();
@@ -971,8 +993,14 @@ public final class PackConverter {
     }
 
     private boolean isShapedBlock(OraxenItem item) {
-        return !Maps.section(item.mechanics(), "shapedblock").isEmpty()
-                || !Maps.section(item.mechanics(), "shaped_block").isEmpty();
+        if (!mechanicSection(item, "shapedblock").isEmpty()) return true;
+        String type = Maps.string(mechanicSection(item, "block"), "type");
+        if (type == null) return false;
+        return switch (type.toUpperCase(Locale.ROOT).replace('-', '_')) {
+            case "STAIR", "STAIRS", "SLAB", "DOOR", "TRAPDOOR",
+                 "TRAP_DOOR", "GRATE", "BULB", "SHAPED" -> true;
+            default -> false;
+        };
     }
 
     private boolean isRelatedModel(String base, String candidate) {
@@ -1018,7 +1046,18 @@ public final class PackConverter {
     }
 
     private String mechanicModel(OraxenItem item, String mechanic) {
-        return Maps.string(Maps.section(item.mechanics(), mechanic), "model");
+        Map<String, Object> section = mechanicSection(item, mechanic);
+        String direct = Maps.string(section, "model");
+        if (direct != null && !direct.isBlank()) return direct;
+        Object appearanceValue = Maps.get(section, "appearance");
+        if (appearanceValue instanceof Map<?, ?> appearance) {
+            String model = Maps.string(appearance, "model");
+            if (model != null && !model.isBlank()) return model;
+        } else if (appearanceValue != null) {
+            String model = String.valueOf(appearanceValue);
+            if (!model.isBlank()) return model;
+        }
+        return null;
     }
 
     private String modelReference(OraxenItem item) {
@@ -1049,10 +1088,27 @@ public final class PackConverter {
     private Map<String, Object> blockMechanic(OraxenItem item) {
         for (String name : List.of("noteblock", "stringblock", "chorusblock",
                 "shapedblock", "shaped_block", "block")) {
-            Map<String, Object> section = Maps.section(item.mechanics(), name);
+            Map<String, Object> section = mechanicSection(item, name);
             if (!section.isEmpty()) return section;
         }
         return Map.of();
+    }
+
+    private Map<String, Object> mechanicSection(OraxenItem item, String name) {
+        String expected = normalizeMechanicName(name);
+        for (Map.Entry<String, Object> entry : item.mechanics().entrySet()) {
+            if (!normalizeMechanicName(entry.getKey()).equals(expected)
+                    || !(entry.getValue() instanceof Map<?, ?> raw)) continue;
+            Map<String, Object> result = new LinkedHashMap<>();
+            raw.forEach((key, value) -> result.put(String.valueOf(key), value));
+            return result;
+        }
+        return Map.of();
+    }
+
+    private String normalizeMechanicName(String value) {
+        return value.toLowerCase(Locale.ROOT)
+                .replace("_", "").replace("-", "");
     }
 
     private JavaModelConverter.ConvertedModel mergeItemVisualModels(

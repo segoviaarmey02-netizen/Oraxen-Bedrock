@@ -12,14 +12,19 @@ public final class PackSource implements AutoCloseable {
     private final FileSystem zipFileSystem;
     private final JavaPackMetadata metadata;
     private final List<Path> assetRoots;
+    private final Path fallbackPackDirectory;
+    private final Set<String> fallbackAssets = new LinkedHashSet<>();
     private final Map<String, Optional<Path>> textureCache = new HashMap<>();
     private final Map<String, Map<String, Optional<Path>>> basenameIndexes =
             new HashMap<>();
     private List<AssetFile> effectiveAssetFiles;
 
-    private PackSource(Path root, FileSystem zipFileSystem) throws IOException {
+    private PackSource(Path root, FileSystem zipFileSystem,
+                       Path fallbackPackDirectory) throws IOException {
         this.root = root;
         this.zipFileSystem = zipFileSystem;
+        this.fallbackPackDirectory = fallbackPackDirectory == null ? null
+                : fallbackPackDirectory.toAbsolutePath().normalize();
         this.metadata = JavaPackMetadata.read(root);
         List<Path> roots = new java.util.ArrayList<>();
         Path baseAssets = root.resolve("assets");
@@ -35,11 +40,18 @@ public final class PackSource implements AutoCloseable {
     }
 
     public static PackSource open(Path configured) throws IOException {
-        if (Files.isDirectory(configured)) return new PackSource(configured, null);
+        return open(configured, null);
+    }
+
+    public static PackSource open(Path configured, Path fallbackPackDirectory)
+            throws IOException {
+        if (Files.isDirectory(configured))
+            return new PackSource(configured, null, fallbackPackDirectory);
         if (Files.isRegularFile(configured)) {
             FileSystem fs = FileSystems.newFileSystem(configured, Collections.emptyMap());
             try {
-                return new PackSource(fs.getPath("/"), fs);
+                return new PackSource(fs.getPath("/"), fs,
+                        fallbackPackDirectory);
             } catch (IOException | RuntimeException exception) {
                 try {
                     fs.close();
@@ -73,6 +85,33 @@ public final class PackSource implements AutoCloseable {
             Path candidate = namespaceRoot.resolve(relative).normalize();
             if (!candidate.startsWith(namespaceRoot)) continue;
             if (Files.isRegularFile(candidate)) return candidate;
+        }
+        return findFallbackAsset(namespace, relative);
+    }
+
+    public int fallbackAssetCount() {
+        return fallbackAssets.size();
+    }
+
+    private Path findFallbackAsset(String namespace, String relative) {
+        if (fallbackPackDirectory == null
+                || !Files.isDirectory(fallbackPackDirectory)) return null;
+        List<Path> candidates = new ArrayList<>();
+        Path namespacedRoot = fallbackPackDirectory.resolve("assets")
+                .resolve(namespace).normalize();
+        candidates.add(namespacedRoot.resolve(relative).normalize());
+        // Oraxen treats pack/models, pack/textures, pack/sounds and pack/font
+        // as the flat source form of assets/oraxen/* in the generated ZIP.
+        if (namespace.equals("oraxen"))
+            candidates.add(fallbackPackDirectory.resolve(relative).normalize());
+        for (Path candidate : candidates) {
+            boolean insideNamespaced = candidate.startsWith(namespacedRoot);
+            boolean insideFlat = namespace.equals("oraxen")
+                    && candidate.startsWith(fallbackPackDirectory);
+            if (!(insideNamespaced || insideFlat)
+                    || !Files.isRegularFile(candidate)) continue;
+            fallbackAssets.add(namespace + ':' + relative);
+            return candidate;
         }
         return null;
     }
