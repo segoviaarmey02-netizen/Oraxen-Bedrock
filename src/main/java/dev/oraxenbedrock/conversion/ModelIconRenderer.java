@@ -3,6 +3,7 @@ package dev.oraxenbedrock.conversion;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonPrimitive;
 
 import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
@@ -24,6 +25,7 @@ import java.util.Map;
 final class ModelIconRenderer {
     private static final int ICON_SIZE = 64;
     private static final int MARGIN = 5;
+    private static final double DEPTH_EPSILON = 1.0e-6;
 
     BufferedImage render(JavaModelConverter.ConvertedModel model) throws IOException {
         if (model == null || model.geometry() == null || model.materials().isEmpty())
@@ -92,33 +94,40 @@ final class ModelIconRenderer {
 
     private int[] textureCanvas(JsonObject geometry) {
         int width = 16, height = 16;
-        JsonArray definitions = geometry.getAsJsonArray("minecraft:geometry");
-        if (definitions == null || definitions.isEmpty()
+        JsonElement geometryElement = geometry.get("minecraft:geometry");
+        if (!(geometryElement instanceof JsonArray definitions) || definitions.isEmpty()
                 || !definitions.get(0).isJsonObject())
             return new int[]{width, height};
-        JsonObject description = definitions.get(0).getAsJsonObject()
-                .getAsJsonObject("description");
-        if (description == null) return new int[]{width, height};
-        if (description.has("texture_width"))
-            width = Math.max(1, description.get("texture_width").getAsInt());
-        if (description.has("texture_height"))
-            height = Math.max(1, description.get("texture_height").getAsInt());
+        JsonElement descriptionElement = definitions.get(0).getAsJsonObject()
+                .get("description");
+        if (!(descriptionElement instanceof JsonObject description))
+            return new int[]{width, height};
+        if (description.has("texture_width")) {
+            JsonElement value = description.get("texture_width");
+            if (value instanceof JsonPrimitive primitive && primitive.isNumber())
+                width = Math.max(1, primitive.getAsInt());
+        }
+        if (description.has("texture_height")) {
+            JsonElement value = description.get("texture_height");
+            if (value instanceof JsonPrimitive primitive && primitive.isNumber())
+                height = Math.max(1, primitive.getAsInt());
+        }
         return new int[]{width, height};
     }
 
     private List<Face> collectFaces(
             JsonObject geometry, Map<String, Texture> textures, Transform gui) {
         List<Face> result = new ArrayList<>();
-        JsonArray definitions = geometry.getAsJsonArray("minecraft:geometry");
-        if (definitions == null) return result;
+        JsonElement geometryElement = geometry.get("minecraft:geometry");
+        if (!(geometryElement instanceof JsonArray definitions)) return result;
         for (JsonElement definitionValue : definitions) {
             if (!definitionValue.isJsonObject()) continue;
-            JsonArray bones = definitionValue.getAsJsonObject().getAsJsonArray("bones");
-            if (bones == null) continue;
+            JsonElement bonesElement = definitionValue.getAsJsonObject().get("bones");
+            if (!(bonesElement instanceof JsonArray bones)) continue;
             for (JsonElement boneValue : bones) {
                 if (!boneValue.isJsonObject()) continue;
-                JsonArray cubes = boneValue.getAsJsonObject().getAsJsonArray("cubes");
-                if (cubes == null) continue;
+                JsonElement cubesElement = boneValue.getAsJsonObject().get("cubes");
+                if (!(cubesElement instanceof JsonArray cubes)) continue;
                 for (JsonElement cubeValue : cubes) {
                     if (cubeValue.isJsonObject())
                         collectCube(cubeValue.getAsJsonObject(), textures, gui, result);
@@ -130,11 +139,14 @@ final class ModelIconRenderer {
 
     private void collectCube(JsonObject cube, Map<String, Texture> textures,
                              Transform gui, List<Face> output) {
-        double[] origin = triple(cube.getAsJsonArray("origin"), 0);
-        double[] size = triple(cube.getAsJsonArray("size"), 0);
-        double x0 = origin[0], x1 = origin[0] + size[0];
-        double y0 = origin[1], y1 = origin[1] + size[1];
-        double z0 = origin[2], z1 = origin[2] + size[2];
+        JsonElement uvElement = cube.get("uv");
+        if (!(uvElement instanceof JsonObject uv)) return;
+        double[] origin = triple(cube.get("origin"), 0);
+        double[] size = triple(cube.get("size"), 0);
+        double sx = Math.abs(size[0]), sy = Math.abs(size[1]), sz = Math.abs(size[2]);
+        double x0 = origin[0], x1 = origin[0] + sx;
+        double y0 = origin[1], y1 = origin[1] + sy;
+        double z0 = origin[2], z1 = origin[2] + sz;
         Map<String, Vec[]> vertices = Map.of(
                 "west", new Vec[]{vec(x0, y0, z1), vec(x0, y0, z0),
                         vec(x0, y1, z0), vec(x0, y1, z1)},
@@ -148,10 +160,8 @@ final class ModelIconRenderer {
                         vec(x0, y1, z0), vec(x1, y1, z0)},
                 "south", new Vec[]{vec(x0, y0, z1), vec(x1, y0, z1),
                         vec(x1, y1, z1), vec(x0, y1, z1)});
-        JsonObject uv = cube.getAsJsonObject("uv");
-        if (uv == null) return;
-        double[] pivot = triple(cube.getAsJsonArray("pivot"), 0);
-        double[] cubeRotation = triple(cube.getAsJsonArray("rotation"), 0);
+        double[] pivot = triple(cube.get("pivot"), 0);
+        double[] cubeRotation = triple(cube.get("rotation"), 0);
 
         for (Map.Entry<String, JsonElement> entry : uv.entrySet()) {
             if (!entry.getValue().isJsonObject()) continue;
@@ -161,16 +171,18 @@ final class ModelIconRenderer {
             String material = string(faceData, "material_instance");
             Texture texture = material == null ? null : textures.get(material);
             if (texture == null) continue;
-            double[] start = pair(faceData.getAsJsonArray("uv"), 0);
-            double[] extent = pair(faceData.getAsJsonArray("uv_size"), 0);
+            double[] start = pair(faceData.get("uv"), 0);
+            double[] extent = pair(faceData.get("uv_size"), 0);
             double[][] coordinates = {
                     {start[0], start[1] + extent[1]},
                     {start[0] + extent[0], start[1] + extent[1]},
                     {start[0] + extent[0], start[1]},
                     {start[0], start[1]}
             };
-            int rotations = faceData.has("uv_rotation")
-                    ? Math.floorMod(faceData.get("uv_rotation").getAsInt(), 360) / 90 : 0;
+            int rotations = 0;
+            JsonElement uvRotation = faceData.get("uv_rotation");
+            if (uvRotation instanceof JsonPrimitive primitive && primitive.isNumber())
+                rotations = Math.floorMod(primitive.getAsInt(), 360) / 90;
             Vertex[] transformed = new Vertex[4];
             for (int index = 0; index < 4; index++) {
                 Vec positioned = rotateAround(
@@ -185,16 +197,18 @@ final class ModelIconRenderer {
     }
 
     private Transform guiTransform(JsonObject display) {
-        JsonObject gui = display == null ? null : display.getAsJsonObject("gui");
-        double[] rotation = gui == null
+        JsonObject gui = null;
+        if (display != null && display.get("gui") instanceof JsonObject value)
+            gui = value;
+        double[] rotation = gui == null || !gui.has("rotation")
                 ? new double[]{30, 225, 0}
-                : triple(gui.getAsJsonArray("rotation"), 0);
-        double[] translation = gui == null
+                : triple(gui.get("rotation"), 0);
+        double[] translation = gui == null || !gui.has("translation")
                 ? new double[]{0, 0, 0}
-                : triple(gui.getAsJsonArray("translation"), 0);
-        double[] scale = gui == null
+                : triple(gui.get("translation"), 0);
+        double[] scale = gui == null || !gui.has("scale")
                 ? new double[]{0.625, 0.625, 0.625}
-                : triple(gui.getAsJsonArray("scale"), 1);
+                : triple(gui.get("scale"), 1);
         return new Transform(rotation, translation, scale);
     }
 
@@ -215,7 +229,11 @@ final class ModelIconRenderer {
                 double wc = 1 - wa - wb;
                 if (wa < -1.0e-7 || wb < -1.0e-7 || wc < -1.0e-7) continue;
                 double z = wa * a.z() + wb * b.z() + wc * c.z();
-                if (z < depth[y][x]) continue;
+                // The two triangles of a quad interpolate the shared diagonal
+                // through different arithmetic, so their z values can differ
+                // by one ULP. Requiring a real depth gain prevents the second
+                // triangle from re-blending the same texel onto itself.
+                if (z < depth[y][x] + DEPTH_EPSILON) continue;
                 double u = wa * a.u() + wb * b.u() + wc * c.u();
                 double v = wa * a.v() + wb * b.v() + wc * c.v();
                 int source = texture.sample(u, v);
@@ -294,21 +312,25 @@ final class ModelIconRenderer {
         return Math.max(0, Math.min(ICON_SIZE - 1, coordinate));
     }
 
-    private double[] triple(JsonArray value, double fallback) {
+    private double[] triple(JsonElement value, double fallback) {
         double[] result = {fallback, fallback, fallback};
-        if (value == null) return result;
-        for (int index = 0; index < Math.min(3, value.size()); index++)
-            if (value.get(index).isJsonPrimitive())
-                result[index] = value.get(index).getAsDouble();
+        if (!(value instanceof JsonArray array)) return result;
+        for (int index = 0; index < Math.min(3, array.size()); index++) {
+            JsonElement element = array.get(index);
+            if (element instanceof JsonPrimitive primitive && primitive.isNumber())
+                result[index] = primitive.getAsDouble();
+        }
         return result;
     }
 
-    private double[] pair(JsonArray value, double fallback) {
+    private double[] pair(JsonElement value, double fallback) {
         double[] result = {fallback, fallback};
-        if (value == null) return result;
-        for (int index = 0; index < Math.min(2, value.size()); index++)
-            if (value.get(index).isJsonPrimitive())
-                result[index] = value.get(index).getAsDouble();
+        if (!(value instanceof JsonArray array)) return result;
+        for (int index = 0; index < Math.min(2, array.size()); index++) {
+            JsonElement element = array.get(index);
+            if (element instanceof JsonPrimitive primitive && primitive.isNumber())
+                result[index] = primitive.getAsDouble();
+        }
         return result;
     }
 

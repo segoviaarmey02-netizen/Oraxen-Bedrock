@@ -2,6 +2,7 @@ package dev.oraxenbedrock.conversion;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonPrimitive;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -13,6 +14,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ModelIconRendererTest {
@@ -71,9 +74,125 @@ class ModelIconRendererTest {
                 "Both halves of a 16px material must survive a 64px UV canvas");
     }
 
+    @Test
+    void appliesJavaGuiDefaultsWhenDisplayFieldsAreMissing() throws Exception {
+        Path texture = solid("defaults.png", 16, 0xFF4488CC);
+        JsonArray cubes = new JsonArray();
+        cubes.add(cube(-8, 0, -8, 16, 16, 16, "mat", 16));
+        Map<String, JavaModelConverter.Material> materials =
+                Map.of("mat", material("mat", texture, 16));
+
+        BufferedImage explicit = new ModelIconRenderer().render(model(
+                cubes, 16, materials, guiDisplay(
+                        triple(30, 225, 0), triple(0, 0, 0),
+                        triple(0.625, 0.625, 0.625))));
+        BufferedImage partial = new ModelIconRenderer().render(model(
+                cubes, 16, materials, guiDisplay(null, triple(0, 0, 0), null)));
+        BufferedImage absent = new ModelIconRenderer().render(
+                model(cubes, 16, materials, null));
+
+        assertSamePixels(explicit, partial,
+                "A gui entry with missing rotation must fall back to Java's default rotation");
+        assertSamePixels(explicit, absent,
+                "A missing gui entry must match the explicit Java display defaults");
+    }
+
+    @Test
+    void doesNotDoubleBlendTransparentPixelsAlongQuadDiagonal() throws Exception {
+        Path glass = temp.resolve("glass.png");
+        BufferedImage source = new BufferedImage(16, 16,
+                BufferedImage.TYPE_INT_ARGB);
+        for (int y = 0; y < 16; y++) for (int x = 0; x < 16; x++)
+            source.setRGB(x, y, 0x80FF4444);
+        ImageIO.write(source, "png", glass.toFile());
+
+        JsonArray cubes = new JsonArray();
+        cubes.add(cube(-8, 0, -8, 16, 16, 16, "glass", 16));
+        BufferedImage icon = new ModelIconRenderer().render(model(
+                cubes, 16, Map.of("glass", material("glass", glass, 16))));
+
+        assertNotNull(icon);
+        for (int y = 0; y < icon.getHeight(); y++)
+            for (int x = 0; x < icon.getWidth(); x++) {
+                int alpha = icon.getRGB(x, y) >>> 24;
+                if (alpha != 0)
+                    assertTrue(alpha <= 140,
+                            "Quad diagonal must not be double-blended at " + x
+                                    + "," + y + " (alpha " + alpha + ")");
+            }
+    }
+
+    @Test
+    void toleratesMalformedUvEntriesWithoutFailing() throws Exception {
+        Path texture = solid("malformed.png", 16, 0xFFFFAA00);
+        JsonArray cubes = new JsonArray();
+        JsonObject stringElement = cube(-8, 0, -8, 16, 16, 16, "mat", 16);
+        JsonArray malformed = new JsonArray();
+        malformed.add(0);
+        malformed.add("garbage");
+        malformed.add(16);
+        malformed.add(16);
+        stringElement.getAsJsonObject("uv").getAsJsonObject("north")
+                .add("uv", malformed);
+        cubes.add(stringElement);
+        JsonObject nonArray = cube(8, 0, -8, 16, 16, 16, "mat", 16);
+        nonArray.getAsJsonObject("uv").getAsJsonObject("north")
+                .add("uv", new JsonPrimitive("broken"));
+        cubes.add(nonArray);
+
+        BufferedImage icon = new ModelIconRenderer().render(model(
+                cubes, 16, Map.of("mat", material("mat", texture, 16))));
+
+        assertNotNull(icon);
+        int visible = 0;
+        for (int y = 0; y < icon.getHeight(); y++)
+            for (int x = 0; x < icon.getWidth(); x++)
+                if ((icon.getRGB(x, y) >>> 24) != 0) visible++;
+        assertTrue(visible > 0,
+                "Faces with malformed uv entries must still render");
+    }
+
+    @Test
+    void rendersNegativeCubeSizesLikeTheirPositiveEquivalents() throws Exception {
+        Path split = temp.resolve("negative-split.png");
+        BufferedImage source = new BufferedImage(16, 16,
+                BufferedImage.TYPE_INT_ARGB);
+        for (int y = 0; y < 16; y++) for (int x = 0; x < 16; x++)
+            source.setRGB(x, y, x < 8 ? 0xFFFF0000 : 0xFF0000FF);
+        ImageIO.write(source, "png", split.toFile());
+        Map<String, JavaModelConverter.Material> materials =
+                Map.of("mat", material("mat", split, 16));
+
+        JsonArray positive = new JsonArray();
+        positive.add(cube(-8, 0, -8, 16, 16, 16, "mat", 16));
+        JsonArray negative = new JsonArray();
+        negative.add(cube(-8, 0, -8, -16, 16, 16, "mat", 16));
+
+        BufferedImage expected = new ModelIconRenderer().render(
+                model(positive, 16, materials));
+        BufferedImage actual = new ModelIconRenderer().render(
+                model(negative, 16, materials));
+
+        assertSamePixels(expected, actual,
+                "Negative cube sizes must be rendered as their absolute extents");
+    }
+
     private JavaModelConverter.ConvertedModel model(
             JsonArray cubes, int textureSize,
             Map<String, JavaModelConverter.Material> materials) {
+        JsonObject gui = new JsonObject();
+        gui.add("rotation", triple(0, 0, 0));
+        gui.add("translation", triple(0, 0, 0));
+        gui.add("scale", triple(1, 1, 1));
+        JsonObject display = new JsonObject();
+        display.add("gui", gui);
+        return model(cubes, textureSize, materials, display);
+    }
+
+    private JavaModelConverter.ConvertedModel model(
+            JsonArray cubes, int textureSize,
+            Map<String, JavaModelConverter.Material> materials,
+            JsonObject display) {
         JsonObject description = new JsonObject();
         description.addProperty("identifier", "geometry.test.icon");
         description.addProperty("texture_width", textureSize);
@@ -90,16 +209,31 @@ class ModelIconRendererTest {
         definitions.add(definition);
         JsonObject geometry = new JsonObject();
         geometry.add("minecraft:geometry", definitions);
-        JsonObject display = new JsonObject();
-        JsonObject gui = new JsonObject();
-        gui.add("rotation", triple(0, 0, 0));
-        gui.add("translation", triple(0, 0, 0));
-        gui.add("scale", triple(1, 1, 1));
-        display.add("gui", gui);
         return new JavaModelConverter.ConvertedModel(
                 "geometry.test.icon", geometry,
                 new LinkedHashMap<>(materials), display,
                 false, false, List.of());
+    }
+
+    private JsonObject guiDisplay(
+            JsonArray rotation, JsonArray translation, JsonArray scale) {
+        JsonObject gui = new JsonObject();
+        if (rotation != null) gui.add("rotation", rotation);
+        if (translation != null) gui.add("translation", translation);
+        if (scale != null) gui.add("scale", scale);
+        JsonObject display = new JsonObject();
+        display.add("gui", gui);
+        return display;
+    }
+
+    private void assertSamePixels(
+            BufferedImage expected, BufferedImage actual, String message) {
+        assertEquals(expected.getWidth(), actual.getWidth(), message);
+        assertEquals(expected.getHeight(), actual.getHeight(), message);
+        for (int y = 0; y < expected.getHeight(); y++)
+            for (int x = 0; x < expected.getWidth(); x++)
+                assertEquals(expected.getRGB(x, y), actual.getRGB(x, y),
+                        message + " (pixel at " + x + "," + y + ")");
     }
 
     private JsonObject cube(double x, double y, double z,

@@ -9,6 +9,8 @@ import java.nio.file.Path;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
+import dev.oraxenbedrock.config.BridgeConfig;
+
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -68,6 +70,26 @@ class OraxenBedrockPluginTest {
                     "{}".getBytes(StandardCharsets.UTF_8));
         }
         assertTrue(OraxenBedrockPlugin.isJavaPackReady(wrappedFlat));
+    }
+
+    @Test
+    void unchangedInputsStillRequireInstalledGeyserOutputs() throws Exception {
+        Path oraxen = temp.resolve("plugins/Oraxen");
+        Path geyser = temp.resolve("plugins/Geyser-Spigot");
+        BridgeConfig config = new BridgeConfig(
+                temp, oraxen, geyser, oraxen.resolve("pack/pack.zip"),
+                "Test", "Test", "oraxen", new int[]{1, 0, 0},
+                true, true, true, true, true, true, true,
+                true, true, 100, false);
+        assertFalse(OraxenBedrockPlugin.hasInstalledBedrockOutput(config));
+
+        Files.createDirectories(geyser.resolve("packs"));
+        Files.createDirectories(geyser.resolve("custom_mappings"));
+        Files.write(geyser.resolve("packs/OraxenBedrock.mcpack"), new byte[]{1});
+        Files.writeString(geyser.resolve("custom_mappings/oraxen-items.json"), "{}");
+        Files.writeString(geyser.resolve("custom_mappings/oraxen-blocks.json"), "{}");
+
+        assertTrue(OraxenBedrockPlugin.hasInstalledBedrockOutput(config));
     }
 
     private static void entry(ZipOutputStream zip, String name, byte[] value)

@@ -15,6 +15,7 @@ import org.bukkit.scheduler.BukkitTask;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
@@ -33,6 +34,8 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
     private BukkitTask startupProbe;
     private BukkitTask oraxenPackTask;
     private Listener oraxenPackListener;
+    private boolean initialPackPending;
+    private volatile long[] lastConvertedPackStamp = {-1, -1};
 
     @Override
     public void onEnable() {
@@ -60,17 +63,29 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
         scheduleWatcher();
         validateEnvironment();
         if (manager.config().generateOnStartup()) {
-            if (isJavaPackReady(manager.config().javaPack())) {
-                // This plugin is declared loadbefore Geyser-Spigot. Complete
-                // the initial installation before onEnable returns so Geyser
-                // can discover the generated mappings during its own startup.
-                manager.generateNow("server startup");
+            if (manager.inputUnchangedSinceLastConversion()
+                    && hasInstalledBedrockOutput(manager.config())) {
+                // Oraxen rewrites pack.zip on every startup even when its
+                // content is unchanged. Geyser re-reads the Bedrock pack and
+                // the mappings only during its own onEnable, so the previous
+                // session's output is loaded as-is and a fresh conversion
+                // would only force an unnecessary restart.
+                getLogger().info("Oraxen content is unchanged since the last conversion; "
+                        + "Geyser will load the existing Bedrock pack.");
             } else {
-                getLogger().warning("Initial conversion is waiting for Oraxen to finish its Java pack: "
-                        + manager.config().javaPack());
-                scheduleStartupProbe();
+                triggerOraxenPackGeneration();
+                scheduleStartupGeneration();
             }
         }
+    }
+
+    static boolean hasInstalledBedrockOutput(BridgeConfig config) {
+        Path geyser = config.geyserDirectory();
+        return Files.isRegularFile(geyser.resolve("packs/OraxenBedrock.mcpack"))
+                && Files.isRegularFile(
+                geyser.resolve("custom_mappings/oraxen-items.json"))
+                && Files.isRegularFile(
+                geyser.resolve("custom_mappings/oraxen-blocks.json"));
     }
 
     @Override
@@ -152,29 +167,146 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
         if (!manager.config().watch()) return;
         long period = manager.config().debounceTicks();
         watcher = getServer().getScheduler().runTaskTimerAsynchronously(
-                this, manager::pollForChanges, period, period);
+                this, () -> {
+                    if (!manager.pollForChanges()) return;
+                    getServer().getScheduler().runTask(this, () -> {
+                        if (startupProbe != null || oraxenPackTask != null
+                                || manager.isRunning()) return;
+                        if (!triggerOraxenPackGeneration()) {
+                            if (oraxenPackListener == null) {
+                                // Legacy Oraxen regenerates pack.zip
+                                // synchronously on its own reload, so the
+                                // archive on disk is current; convert it.
+                                manager.generate("Oraxen files changed", null, null);
+                            } else {
+                                getLogger().warning("Oraxen source files changed, but this Oraxen "
+                                        + "version could not be asked to regenerate pack.zip. "
+                                        + "Reload Oraxen; its pack-generated event will trigger conversion.");
+                            }
+                            return;
+                        }
+                        schedulePackConversion("Oraxen files changed", false);
+                    });
+                }, period, period);
     }
 
-    private void scheduleStartupProbe() {
+    private boolean triggerOraxenPackGeneration() {
+        Plugin oraxen = getServer().getPluginManager().getPlugin("Oraxen");
+        if (oraxen == null) return false;
+        try {
+            Class<?> pluginClass = Class.forName(
+                    "io.th0rgal.oraxen.OraxenPlugin", false,
+                    oraxen.getClass().getClassLoader());
+            Method get = pluginClass.getMethod("get");
+            Object pluginInstance = get.invoke(null);
+            if (pluginInstance == null) return false;
+            Method getResourcePack = pluginClass.getMethod("getResourcePack");
+            Object resourcePack = getResourcePack.invoke(pluginInstance);
+            if (resourcePack == null) return false;
+            Method generate = resourcePack.getClass().getMethod("generate");
+            generate.invoke(resourcePack);
+            getLogger().info("Requested a fresh Oraxen Java pack through the Oraxen API.");
+            return true;
+        } catch (ReflectiveOperationException | LinkageError exception) {
+            getLogger().warning("This Oraxen version does not expose the pack generation API; "
+                    + "waiting for the existing pack write instead.");
+            return false;
+        }
+    }
+
+    private void scheduleStartupGeneration() {
+        schedulePackConversion("Oraxen pack write completed", true);
+    }
+
+    private void schedulePackConversion(String reason, boolean initial) {
         if (startupProbe != null) startupProbe.cancel();
-        final int[] attempts = {0};
+        initialPackPending = initial;
+        Path pack = manager.config().javaPack();
+        // Oraxen regenerates pack.zip asynchronously after its own onEnable.
+        // The archive left over from the previous run is not a fresh input:
+        // converting it would ship a Bedrock pack built from stale Oraxen
+        // content. Wait until Oraxen rewrites the archive (observed as a
+        // size/timestamp change), or reports completion through the
+        // OraxenPackGeneratedEvent hook, before the initial conversion.
+        long[] baseline = fileStamp(pack);
+        long[] observed = {-1, -1};
+        int[] stableChecks = {0};
+        int[] attempts = {0};
+        // Without the event hook Oraxen generated synchronously inside its
+        // own onEnable, so the pack already on disk is current; with the hook
+        // allow a longer window for the asynchronous rewrite to start.
+        int grace = oraxenPackListener == null ? 30 : 150;
+        getLogger().warning((initial ? "Initial conversion is waiting"
+                : "Conversion is waiting")
+                + " for Oraxen to finish its Java pack: " + pack);
         startupProbe = getServer().getScheduler().runTaskTimer(this, () -> {
-            Path pack = manager.config().javaPack();
             attempts[0]++;
-            if (isJavaPackReady(pack)) {
-                startupProbe.cancel();
-                startupProbe = null;
-                manager.generate("Oraxen pack became ready", null, null);
-                getLogger().warning("The first Bedrock pack was generated after Geyser startup; "
-                        + "restart the server once so Geyser loads the new mappings.");
+            long[] current = fileStamp(pack);
+            boolean exists = current[0] > 0;
+            if (!exists) {
+                if (attempts[0] >= 600) {
+                    startupProbe.cancel();
+                    startupProbe = null;
+                    getLogger().severe("Oraxen did not create its Java pack within 10 minutes: "
+                            + pack);
+                }
                 return;
             }
-            if (attempts[0] >= 600) {
+            boolean fresh = baseline[0] <= 0
+                    || current[0] != baseline[0] || current[1] != baseline[1];
+            if (fresh) {
+                boolean stable = current[0] == observed[0]
+                        && current[1] == observed[1];
+                stableChecks[0] = stable ? stableChecks[0] + 1 : 0;
+                observed[0] = current[0];
+                observed[1] = current[1];
+                if (stableChecks[0] >= 1) {
+                    startupProbe.cancel();
+                    startupProbe = null;
+                    initialPackPending = false;
+                    lastConvertedPackStamp = observed[0] == -1
+                            ? fileStamp(pack) : observed;
+                    manager.generate(reason, null, null);
+                    logGeyserRestartRequired(initial);
+                }
+                return;
+            }
+            // The pack exists but Oraxen has not rewritten it since this
+            // plugin enabled. Only Oraxen versions without the pack-generated
+            // event generate synchronously inside their own onEnable, so the
+            // archive on disk is already current there; modern Oraxen always
+            // reports its asynchronous rewrite through the event hook, which
+            // cancels this probe. Converting an unchanged archive on modern
+            // Oraxen would ship stale content.
+            if (attempts[0] >= grace && oraxenPackListener == null) {
                 startupProbe.cancel();
                 startupProbe = null;
-                getLogger().severe("Oraxen did not create its Java pack within 10 minutes: " + pack);
+                initialPackPending = false;
+                lastConvertedPackStamp = fileStamp(pack);
+                manager.generate(reason, null, null);
+                logGeyserRestartRequired(initial);
             }
-        }, 20L, 20L);
+        }, 2L, 2L);
+    }
+
+    private void logGeyserRestartRequired(boolean initial) {
+        if (initial)
+            getLogger().warning("The first Bedrock pack was generated after Geyser startup; "
+                    + "restart the server once so Geyser loads the new mappings.");
+        else
+            getLogger().warning("The Bedrock pack changed after Geyser startup; restart Geyser "
+                    + "or the server so it reloads the pack and mappings.");
+    }
+
+    private long[] fileStamp(Path pack) {
+        try {
+            BasicFileAttributes attributes =
+                    Files.readAttributes(pack, BasicFileAttributes.class);
+            return new long[]{attributes.size(),
+                    attributes.lastModifiedTime().toMillis()};
+        } catch (IOException ignored) {
+            return new long[]{-1, -1};
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -200,11 +332,12 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
 
     private void scheduleAfterOraxenPackWrite() {
         if (oraxenPackTask != null) oraxenPackTask.cancel();
-        boolean firstPackWasPending = startupProbe != null;
+        boolean firstPackWasPending = startupProbe != null && initialPackPending;
         if (startupProbe != null) {
             startupProbe.cancel();
             startupProbe = null;
         }
+        initialPackPending = false;
         Path pack = manager.config().javaPack();
         long[] lastSize = {-1};
         long[] lastModified = {-1};
@@ -235,6 +368,24 @@ public final class OraxenBedrockPlugin extends JavaPlugin implements CommandExec
             if (stableChecks[0] >= 1) {
                 oraxenPackTask.cancel();
                 oraxenPackTask = null;
+                // The startup conversion may already have consumed this exact
+                // archive; do not convert the same file twice.
+                long[] stamp = {size, modified};
+                if (stamp[0] == lastConvertedPackStamp[0]
+                        && stamp[1] == lastConvertedPackStamp[1]) {
+                    getLogger().info("Oraxen pack write completed; the archive was already converted.");
+                    return;
+                }
+                // Oraxen regenerates pack.zip on every startup, but Geyser
+                // loads its pack only once, so converting an archive whose
+                // source content is unchanged would force an unnecessary
+                // server restart.
+                if (manager.inputUnchangedSinceLastConversion()) {
+                    getLogger().info("Oraxen pack write completed but its content is unchanged; "
+                            + "keeping the existing Bedrock pack.");
+                    return;
+                }
+                lastConvertedPackStamp = stamp;
                 manager.generate("Oraxen pack write completed", null, null);
                 if (firstPackWasPending)
                     getLogger().warning("The first Bedrock pack was generated after Geyser startup; "
