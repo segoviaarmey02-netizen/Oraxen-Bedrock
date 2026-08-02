@@ -1,4 +1,4 @@
-# OraxenBedrock 2.7.2 — Minecraft Java 1.20.5+
+# OraxenBedrock 2.8.0 — Minecraft Java 1.20.5+
 auto-generate:
   on-startup: true
   watch-files: true
@@ -32,8 +32,9 @@ conversion:
   blocks: true
   # Generates Bedrock font/glyph_XX.png pages from Java bitmap font providers.
   glyphs-and-emojis: true
-  # Minimum Oraxen emoji/glyph cell: 32, 64, or 128 pixels.
-  # 64 fixes tiny Oraxen emoji on Bedrock; increase to 128 only if needed.
+  # Minimum resolution of each Oraxen emoji/glyph cell: 32, 64, or 128 pixels.
+  # Emojis fill the final shared Bedrock cell, so HD/UI glyphs on the same page
+  # cannot make normal emojis tiny. Increase to 128 only for sharper HD art.
   emoji-cell-size: 64
   # Converts assets/*/lang JSON files into Bedrock texts/*.lang files.
   localizations: true

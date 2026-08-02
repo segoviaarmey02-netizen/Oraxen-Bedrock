@@ -134,8 +134,7 @@ final class EquipmentPreconverter {
                     item, geometryData, materials, textureTarget, warnings);
         }
         String geometry = writeAttachableGeometry(safeId, model, geometryData);
-        DisplaySetup display = writeDisplayAnimations(
-                safeId, model.display(), armorSlot(item) != null);
+        DisplaySetup display = writeDisplayAnimations(safeId, model.display());
         List<String> frameTextures = animation == null ? List.of()
                 : animationConverter.writeFrameFiles(textureTarget, texturePath, animation);
         String renderController = animation == null
@@ -157,7 +156,7 @@ final class EquipmentPreconverter {
             JsonArray bones = definition.getAsJsonArray("bones");
             if (bones != null && !bones.isEmpty()) {
                 bones.get(0).getAsJsonObject().addProperty("binding",
-                        "q.item_slot_to_bone_name(c.item_slot)");
+                        "q.item_slot_to_bone_name(context.item_slot)");
             }
         }
         JsonSupport.write(bedrock.resolve("models").resolve(outputNamespace)
@@ -454,7 +453,11 @@ final class EquipmentPreconverter {
                                  List<Integer> sequence,
                                  List<List<Integer>> uniqueFrames) {}
     private record DisplayTransform(double[] rotation, double[] translation,
-                                    double[] scale) {}
+                                    double[] scale) {
+        private static final DisplayTransform IDENTITY = new DisplayTransform(
+                new double[]{0, 0, 0}, new double[]{0, 0, 0},
+                new double[]{1, 1, 1});
+    }
     private record DisplaySetup(JsonObject animations, JsonArray animate) {
         private static final DisplaySetup EMPTY =
                 new DisplaySetup(new JsonObject(), new JsonArray());
@@ -534,21 +537,43 @@ final class EquipmentPreconverter {
     }
 
     private DisplaySetup writeDisplayAnimations(
-            String id, JsonObject display, boolean equipped) throws IOException {
-        if (display == null || display.isEmpty()) return DisplaySetup.EMPTY;
+            String id, JsonObject display) throws IOException {
+        JsonObject source = display == null ? new JsonObject() : display;
+        DisplayTransform first = Optional.ofNullable(firstTransform(source,
+                        "firstperson_righthand", "firstperson_lefthand"))
+                .orElse(DisplayTransform.IDENTITY);
+        DisplayTransform third = Optional.ofNullable(firstTransform(source,
+                        "thirdperson_righthand", "thirdperson_lefthand"))
+                .orElse(DisplayTransform.IDENTITY);
+        DisplayTransform head = Optional.ofNullable(
+                        readDisplayTransform(source, "head"))
+                .orElse(DisplayTransform.IDENTITY);
+
         Map<String, DisplayTransform> transforms = new LinkedHashMap<>();
-        if (equipped) {
-            DisplayTransform head = readDisplayTransform(display, "head");
-            if (head != null) transforms.put("equipped", head);
-        } else {
-            DisplayTransform first = firstTransform(display,
-                    "firstperson_righthand", "firstperson_lefthand");
-            DisplayTransform third = firstTransform(display,
-                    "thirdperson_righthand", "thirdperson_lefthand");
-            if (first != null) transforms.put("first_person", first);
-            if (third != null) transforms.put("third_person", third);
-        }
-        if (transforms.isEmpty()) return DisplaySetup.EMPTY;
+        transforms.put("first_person", new DisplayTransform(
+                new double[]{-90 + first.rotation()[1],
+                        -first.rotation()[2], first.rotation()[0]},
+                new double[]{-first.translation()[1],
+                        12.5 + first.translation()[2],
+                        first.translation()[0]},
+                first.scale()));
+        // Bedrock's third-person item bone uses a different coordinate basis
+        // and already has a +90 degree X rotation.
+        transforms.put("third_person", new DisplayTransform(
+                new double[]{90, -third.rotation()[2], -third.rotation()[1]},
+                new double[]{-third.translation()[0],
+                        12.5 + third.translation()[2],
+                        -third.translation()[1]},
+                third.scale()));
+        transforms.put("head", new DisplayTransform(
+                new double[]{-head.rotation()[0],
+                        -head.rotation()[1], head.rotation()[2]},
+                new double[]{-head.translation()[0] * 0.655,
+                        20 + head.translation()[1] * 0.655,
+                        head.translation()[2] * 0.655},
+                new double[]{head.scale()[0] * 0.655,
+                        head.scale()[1] * 0.655,
+                        head.scale()[2] * 0.655}));
 
         JsonObject definitions = new JsonObject();
         JsonObject references = new JsonObject();
@@ -571,15 +596,23 @@ final class EquipmentPreconverter {
             if (entry.getKey().equals("first_person")) {
                 JsonObject condition = new JsonObject();
                 condition.addProperty(shortName,
-                        "context.is_first_person == 1.0");
+                        "context.is_first_person == 1.0 && "
+                                + "(context.item_slot == 'main_hand' || "
+                                + "context.item_slot == 'off_hand')");
                 animate.add(condition);
             } else if (entry.getKey().equals("third_person")) {
                 JsonObject condition = new JsonObject();
                 condition.addProperty(shortName,
-                        "context.is_first_person == 0.0");
+                        "context.is_first_person == 0.0 && "
+                                + "(context.item_slot == 'main_hand' || "
+                                + "context.item_slot == 'off_hand')");
                 animate.add(condition);
             } else {
-                animate.add(shortName);
+                JsonObject condition = new JsonObject();
+                condition.addProperty(shortName,
+                        "context.is_first_person == 0.0 && "
+                                + "context.item_slot == 'head'");
+                animate.add(condition);
             }
         }
         JsonObject root = new JsonObject();
@@ -602,10 +635,7 @@ final class EquipmentPreconverter {
         double[] rotation = triple(value.getAsJsonArray("rotation"), 0);
         double[] translation = triple(value.getAsJsonArray("translation"), 0);
         double[] scale = triple(value.getAsJsonArray("scale"), 1);
-        return new DisplayTransform(
-                new double[]{-rotation[0], -rotation[1], rotation[2]},
-                new double[]{translation[0], translation[1], -translation[2]},
-                scale);
+        return new DisplayTransform(rotation, translation, scale);
     }
 
     private double[] triple(JsonArray values, double fallback) {

@@ -17,7 +17,7 @@ class FontConverterTest {
     @TempDir Path temp;
 
     @Test
-    void upscalesSmallEmojisAndKeepsDifferentDeclaredSizes() throws Exception {
+    void fillsSharedPageCellSoLargeGlyphCannotShrinkInlineEmojis() throws Exception {
         Path textures = temp.resolve("assets/oraxen/textures/font");
         Path fonts = temp.resolve("assets/oraxen/font");
         Files.createDirectories(textures);
@@ -55,12 +55,15 @@ class FontConverterTest {
         assertEquals(2048, page.getWidth());
         assertEquals(2048, page.getHeight());
 
+        // Bedrock applies one common cell size to the entire page. Both inline
+        // emojis must fill that final 128px cell even though the third glyph's
+        // Java height is what selected the larger page resolution.
         Bounds small = alphaBounds(page, 0, 0, 128);
-        assertEquals(57, small.width());
-        assertEquals(64, small.height());
+        assertEquals(114, small.width());
+        assertEquals(128, small.height());
         Bounds medium = alphaBounds(page, 128, 0, 128);
-        assertEquals(64, medium.width());
-        assertEquals(64, medium.height());
+        assertEquals(128, medium.width());
+        assertEquals(128, medium.height());
         Bounds large = alphaBounds(page, 256, 0, 128);
         assertEquals(128, large.width());
         assertEquals(128, large.height());
@@ -164,6 +167,55 @@ class FontConverterTest {
         Bounds glyph = alphaBounds(page, 0, 64, 64);
         assertEquals(64, glyph.width());
         assertEquals(64, glyph.height());
+    }
+
+    @Test
+    void currentOraxenEmojiStaysFullSizeBesideLargeInterfaceGlyph() throws Exception {
+        Path textures = temp.resolve("assets/minecraft/textures/font");
+        Path fonts = temp.resolve("assets/minecraft/font");
+        Files.createDirectories(textures);
+        Files.createDirectories(fonts);
+        writeSolidPng(textures.resolve("heart.png"), 8, 8, 0xFFFF2020);
+        writeSolidPng(textures.resolve("menu.png"), 128, 128, 0xFF2020FF);
+        Files.writeString(fonts.resolve("default.json"), """
+                {"providers":[
+                  {"type":"bitmap","file":"minecraft:font/heart.png",
+                   "height":8,"ascent":8,"chars":["\uA410"]},
+                  {"type":"bitmap","file":"minecraft:font/menu.png",
+                   "height":128,"ascent":37,"chars":["\uA411"]}
+                ]}
+                """);
+
+        Path glyphs = temp.resolve("glyphs");
+        Files.createDirectories(glyphs);
+        Files.writeString(glyphs.resolve("emoji.yml"), """
+                heart:
+                  texture: font/heart
+                  ascent: 8
+                  height: 8
+                menu_items:
+                  texture: font/menu
+                  ascent: 37
+                  height: 256
+                """);
+
+        Path bedrock = temp.resolve("bedrock-mixed-auto");
+        List<String> warnings = new ArrayList<>();
+        try (PackSource source = PackSource.open(temp)) {
+            FontConverter.Result result = new FontConverter(
+                    source, bedrock, 64, glyphs).convert(warnings);
+            assertEquals(2, result.glyphs());
+            assertEquals(1, result.pages());
+        }
+
+        assertTrue(warnings.isEmpty(), () -> String.join("\n", warnings));
+        BufferedImage page = ImageIO.read(
+                bedrock.resolve("font/glyph_A4.png").toFile());
+        assertNotNull(page);
+        assertEquals(2048, page.getWidth());
+        Bounds heart = alphaBounds(page, 0, 128, 128);
+        assertEquals(128, heart.width());
+        assertEquals(128, heart.height());
     }
 
     @Test

@@ -670,9 +670,9 @@ class PackConverterTest {
             JsonArray staffCubes = staffDefinition.getAsJsonArray("bones").get(0)
                     .getAsJsonObject().getAsJsonArray("cubes");
             JsonObject redFace = staffCubes.get(0).getAsJsonObject()
-                    .getAsJsonObject("uv").getAsJsonObject("south");
+                    .getAsJsonObject("uv").getAsJsonObject("north");
             JsonObject blueFace = staffCubes.get(1).getAsJsonObject()
-                    .getAsJsonObject("uv").getAsJsonObject("south");
+                    .getAsJsonObject("uv").getAsJsonObject("north");
             assertEquals(0, redFace.getAsJsonArray("uv").get(0).getAsInt());
             assertEquals(16, redFace.getAsJsonArray("uv_size").get(0).getAsInt());
             assertEquals(16, blueFace.getAsJsonArray("uv").get(0).getAsInt());
@@ -703,10 +703,10 @@ class PackConverterTest {
                     .getAsJsonObject(
                             "animation.oraxen.dual_staff.display.first_person")
                     .getAsJsonObject("bones").getAsJsonObject("root");
-            assertEquals(List.of(-10.0, -20.0, 30.0),
+            assertEquals(List.of(-70.0, -30.0, 10.0),
                     firstPerson.getAsJsonArray("rotation").asList().stream()
                             .map(JsonElement::getAsDouble).toList());
-            assertEquals(List.of(1.0, 2.0, -3.0),
+            assertEquals(List.of(-2.0, 15.5, 1.0),
                     firstPerson.getAsJsonArray("position").asList().stream()
                             .map(JsonElement::getAsDouble).toList());
             JsonObject staffAttachable = JsonSupport.readObject(pack.getPath(
@@ -716,7 +716,7 @@ class PackConverterTest {
                     .getAsJsonObject("description");
             assertTrue(staffDescription.getAsJsonObject("animations")
                     .has("display_first_person"));
-            assertEquals(2, staffDescription.getAsJsonObject("scripts")
+            assertEquals(3, staffDescription.getAsJsonObject("scripts")
                     .getAsJsonArray("animate").size());
             assertTrue(Files.isRegularFile(pack.getPath(
                     "/render_controllers/oraxen/chair.render_controllers.json")));
@@ -792,7 +792,8 @@ class PackConverterTest {
         assertEquals(2, report.get("sound_files").getAsInt());
         assertEquals(2, report.get("glyphs_and_emojis").getAsInt());
         assertEquals(1, report.get("glyph_pages").getAsInt());
-        assertEquals(8, report.get("animated_textures").getAsInt());
+        assertEquals(5, report.get("animated_textures").getAsInt(),
+                "Rendered 3D thumbnails must not duplicate attachable animations");
     }
 
     @Test

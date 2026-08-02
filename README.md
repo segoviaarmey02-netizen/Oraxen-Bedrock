@@ -16,6 +16,8 @@ generation.
 - `plugins/Geyser-Spigot/packs/OraxenBedrock.mcpack`
 - `plugins/Geyser-Spigot/custom_mappings/oraxen-items.json` (Geyser v2 items)
 - `plugins/Geyser-Spigot/custom_mappings/oraxen-blocks.json` (block states)
+- `plugins/Geyser-Spigot/extensions/geyserdisplayentity/Mappings/oraxen.yml`
+  (created when GeyserDisplayEntity is installed)
 - `plugins/OraxenBedrock/last-report.json` (conversion diagnostics)
 
 The converter reads Oraxen YAML plus its generated `pack/pack.zip`. Wrapped
@@ -57,6 +59,10 @@ models such as `oraxen:item_id/active` therefore retain their own icon,
 geometry and attachable. `Pack.gui_model` display-context branches are used for
 the Bedrock inventory icon while the normal fallback model remains the held
 3D model, which preserves the intended split for custom swords and tools.
+When no dedicated GUI sprite exists, cube-based 3D furniture and items are
+rendered into a 64×64 inventory thumbnail using all materials and the Java
+`display.gui` transform. The inventory therefore shows the model silhouette
+instead of exposing the first texture or an unrecognisable UV atlas.
 Oraxen's `model_data_ids` appearance mode is discovered inside the vanilla
 material item definition and emitted with the matching Geyser
 `custom_model_data` string predicate. The numeric `model_data_float` mode is
@@ -105,11 +111,13 @@ When Java font providers repeat a code point, the first provider wins, matching
 Java's font-provider semantics.
 
 Private-use emoji pages use a configurable 64 px minimum cell (1024×1024
-page) by default. Small 8×9 and 16×16 pixel-art emoji are enlarged with
-nearest-neighbour sampling, while declared 32/64/128 px sizes and
-high-resolution sources are kept on appropriately larger page grids without
-blurring. Set `conversion.emoji-cell-size` to `32`, `64`, or `128` to tune
-the visual size for a specific Bedrock UI scale.
+page) by default. Bedrock applies one cell resolution to all 256 characters on
+a glyph page, so every Oraxen emoji now fills the final shared cell even when a
+128 px UI glyph on that page increases its resolution. Small 8×9 and 16×16
+pixel art is enlarged with nearest-neighbour sampling and no longer becomes
+half-size beside HD glyphs. Set `conversion.emoji-cell-size` to `32`, `64`, or
+`128` to control minimum sharpness; it is not a second visual scale inside the
+shared Bedrock cell.
 
 Animated Java textures with a sibling `texture.png.mcmeta` are converted too:
 
@@ -192,10 +200,24 @@ empty one.
 
 Minecraft Java shaders and the exact placement/animation behavior of runtime
 display-entity furniture have no lossless Bedrock resource-pack equivalent.
-Block-backed decorations are mapped normally; display-entity furniture keeps
-its icon, converted geometry and attachable, while the final placed rendering
-still depends on the Geyser version's display-entity translation. Optional
-native Bedrock replacements can be placed in:
+Stock Geyser does not translate Java `ItemDisplay`/`BlockDisplay` entities, so
+a resource pack alone cannot show Oraxen's default `DISPLAY_ENTITY` furniture
+after placement. OraxenBedrock detects the GeyserDisplayEntity extension and
+atomically generates its current mapping schema at:
+
+```text
+plugins/Geyser-Spigot/extensions/geyserdisplayentity/Mappings/oraxen.yml
+```
+
+Install both the extension and its official
+`GeyserDisplayEntityPack.mcpack` companion in Geyser's `packs/` directory. The
+converter validates the companion UUID and reports a clear warning if either
+part is missing. A full server/Geyser restart is required after installation.
+If no extension is desired, set the affected Oraxen furniture to
+`type: ARMOR_STAND`; the generated head-bound 3D attachable supports that
+fallback. Block-backed decorations are mapped normally.
+
+Optional native Bedrock replacements can be placed in:
 
 ```text
 plugins/OraxenBedrock/overrides/
@@ -212,7 +234,7 @@ Requires JDK 21+ and Maven:
 mvn clean package
 ```
 
-Install `target/OraxenBedrock-2.7.2.jar` alongside Oraxen and Geyser, then
+Install `target/OraxenBedrock-2.8.0.jar` alongside Oraxen and Geyser, then
 restart the server. By default the bridge enables
 `gameplay.enable-custom-content: true` in an existing Geyser config before
 Geyser starts; this can be disabled with

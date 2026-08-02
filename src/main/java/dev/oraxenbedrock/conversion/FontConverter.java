@@ -117,7 +117,15 @@ final class FontConverter {
                 Glyph definition = glyph.getValue();
                 BufferedImage image = definition.image();
                 int visualSize = definition.emoji()
-                        ? visualCellSize(definition)
+                        // A Bedrock glyph sheet has one shared cell resolution
+                        // for all 256 codepoints. Keeping an inline emoji at
+                        // its pre-page size makes it occupy only part of the
+                        // cell whenever an HD or large UI glyph selects a
+                        // larger page, so Bedrock renders that emoji visibly
+                        // smaller. Inline glyphs must fill the final cell; the
+                        // page resolution controls detail, not Java's per-
+                        // provider display height.
+                        ? cellSize
                         : intrinsicCellSize(definition);
                 Target target = fit(image.getWidth(), image.getHeight(),
                         index % 16 * cellSize, index / 16 * cellSize, cellSize,
@@ -265,12 +273,12 @@ final class FontConverter {
             required = Math.max(required, Math.max(
                     glyph.image().getWidth(), glyph.image().getHeight()));
             if (glyph.emoji())
-                required = Math.max(required, visualCellSize(glyph));
+                required = Math.max(required, emojiResolution(glyph));
         }
         return powerOfTwoCell(required);
     }
 
-    private int visualCellSize(Glyph glyph) {
+    private int emojiResolution(Glyph glyph) {
         int requested = Math.max(minEmojiCell, glyph.height() * 2);
         return powerOfTwoCell(requested);
     }

@@ -49,7 +49,7 @@ final class JavaItemModelResolver {
         List<String> warnings = new ArrayList<>();
         List<Candidate> candidates = new ArrayList<>();
         Set<String> guiModels = new LinkedHashSet<>();
-        collectGuiModels(node, guiModels, 0);
+        collectGuiModels(node, guiModels, 0, false);
         collect(node, List.of(), true, false, candidates, warnings, 0);
         Candidate baseline = candidates.stream().filter(Candidate::baseline)
                 .findFirst().orElse(candidates.isEmpty() ? null : candidates.get(0));
@@ -82,7 +82,8 @@ final class JavaItemModelResolver {
      * into the default icon.
      */
     private void collectGuiModels(
-            JsonElement node, Set<String> output, int depth) {
+            JsonElement node, Set<String> output, int depth,
+            boolean insideGuiBranch) {
         if (node == null || node.isJsonNull() || depth > 32
                 || !node.isJsonObject()) return;
         JsonObject object = node.getAsJsonObject();
@@ -93,19 +94,23 @@ final class JavaItemModelResolver {
         switch (shortType) {
             case "model" -> {
                 String model = primitive(object.get("model"));
-                if (model != null) output.add(normalize(model));
+                if (insideGuiBranch && model != null)
+                    output.add(normalize(model));
             }
             case "composite" -> {
                 JsonArray models = array(object.get("models"));
                 if (models != null)
                     models.forEach(value ->
-                            collectGuiModels(value, output, depth + 1));
+                            collectGuiModels(value, output, depth + 1,
+                                    insideGuiBranch));
             }
             case "special" -> {
                 JsonElement base = object.get("base");
                 String reference = primitive(base);
-                if (reference != null) output.add(normalize(reference));
-                else collectGuiModels(base, output, depth + 1);
+                if (insideGuiBranch && reference != null)
+                    output.add(normalize(reference));
+                else collectGuiModels(base, output, depth + 1,
+                        insideGuiBranch);
             }
             case "select" -> {
                 if (shortProperty(property(object)).equals("display_context")) {
@@ -118,23 +123,31 @@ final class JavaItemModelResolver {
                                         valueName.toLowerCase(Locale.ROOT))
                                 .anyMatch("gui"::equals))
                             collectGuiModels(
-                                    entry.get("model"), output, depth + 1);
+                                    entry.get("model"), output, depth + 1, true);
                     }
+                    // A fallback can itself contain a nested display-context
+                    // selector, but it is not a GUI icon merely because it is
+                    // the outer selector's normal branch.
+                    collectGuiModels(object.get("fallback"), output,
+                            depth + 1, false);
                     return;
                 }
                 collectGuiModels(
-                        fallbackOrFirst(object, "cases"), output, depth + 1);
+                        fallbackOrFirst(object, "cases"), output, depth + 1,
+                        insideGuiBranch);
             }
             case "condition" -> collectGuiModels(
                     object.has("on_false")
                             ? object.get("on_false") : object.get("on_true"),
-                    output, depth + 1);
+                    output, depth + 1, insideGuiBranch);
             case "range_dispatch" -> collectGuiModels(
-                    fallbackOrFirst(object, "entries"), output, depth + 1);
+                    fallbackOrFirst(object, "entries"), output, depth + 1,
+                    insideGuiBranch);
             default -> {
                 JsonElement model = object.get("model");
                 if (model != null)
-                    collectGuiModels(model, output, depth + 1);
+                    collectGuiModels(model, output, depth + 1,
+                            insideGuiBranch);
             }
         }
     }

@@ -77,6 +77,12 @@ final class JavaModelConverter {
         int textureWidth = materials.values().stream().mapToInt(Material::width).max().orElse(16);
         int textureHeight = materials.values().stream().mapToInt(Material::height).max().orElse(16);
         JsonArray cubes = new JsonArray();
+        double minX = Double.POSITIVE_INFINITY;
+        double minY = Double.POSITIVE_INFINITY;
+        double minZ = Double.POSITIVE_INFINITY;
+        double maxX = Double.NEGATIVE_INFINITY;
+        double maxY = Double.NEGATIVE_INFINITY;
+        double maxZ = Double.NEGATIVE_INFINITY;
         for (JsonElement elementValue : modelElements) {
             if (!elementValue.isJsonObject()) continue;
             JsonObject element = elementValue.getAsJsonObject();
@@ -88,9 +94,16 @@ final class JavaModelConverter {
             }
             double fx = number(from, 0), fy = number(from, 1), fz = number(from, 2);
             double tx = number(to, 0), ty = number(to, 1), tz = number(to, 2);
+            double sizeX = Math.abs(tx - fx);
+            double sizeY = Math.abs(ty - fy);
+            double sizeZ = Math.abs(tz - fz);
+            double sourceX = Math.min(fx, tx) - 8;
+            double originX = -(sourceX + sizeX);
+            double originY = Math.min(fy, ty);
+            double originZ = Math.min(fz, tz) - 8;
             JsonObject cube = new JsonObject();
-            cube.add("origin", vector(fx - 8, fy, 8 - tz));
-            cube.add("size", vector(tx - fx, ty - fy, tz - fz));
+            cube.add("origin", vector(originX, originY, originZ));
+            cube.add("size", vector(sizeX, sizeY, sizeZ));
             if (element.has("rotation") && element.get("rotation").isJsonObject())
                 addRotation(cube, element.getAsJsonObject("rotation"), warnings);
             JsonObject faces = element.getAsJsonObject("faces");
@@ -99,6 +112,12 @@ final class JavaModelConverter {
                         faces, resolved.textures, materials, from, to,
                         textureWidth, textureHeight));
             cubes.add(cube);
+            minX = Math.min(minX, originX);
+            minY = Math.min(minY, originY);
+            minZ = Math.min(minZ, originZ);
+            maxX = Math.max(maxX, originX + sizeX);
+            maxY = Math.max(maxY, originY + sizeY);
+            maxZ = Math.max(maxZ, originZ + sizeZ);
         }
         if (cubes.isEmpty())
             return new ConvertedModel(geometryId(itemId), null, materials,
@@ -111,10 +130,13 @@ final class JavaModelConverter {
         description.addProperty("texture_height", textureHeight);
         description.addProperty("visible_bounds_width", 4);
         description.addProperty("visible_bounds_height", 4);
-        description.add("visible_bounds_offset", vector(0, 1, 0));
+        description.add("visible_bounds_offset", vector(0, 0.75, 0));
         JsonObject bone = new JsonObject();
         bone.addProperty("name", "root");
-        bone.add("pivot", vector(0, 0, 0));
+        bone.add("pivot", vector(
+                (minX + maxX) / 2,
+                (minY + maxY) / 2,
+                (minZ + maxZ) / 2));
         bone.add("cubes", cubes);
         JsonArray bones = new JsonArray();
         bones.add(bone);
@@ -226,11 +248,26 @@ final class JavaModelConverter {
             JsonArray uv = javaFace.getAsJsonArray("uv");
             if (!validUv(uv)) uv = defaultUv(entry.getKey(), from, to);
             JsonObject bedrockFace = new JsonObject();
-            bedrockFace.add("uv", vector(
-                    number(uv, 0) * scaleX, number(uv, 1) * scaleY));
-            bedrockFace.add("uv_size", vector(
-                    (number(uv, 2) - number(uv, 0)) * scaleX,
-                    (number(uv, 3) - number(uv, 1)) * scaleY));
+            boolean horizontal = entry.getKey().equals("up")
+                    || entry.getKey().equals("down");
+            if (horizontal) {
+                // Bedrock reads top/bottom UVs from the opposite corner. A
+                // negative extent preserves Java's face orientation instead
+                // of mirroring furniture seats and table tops.
+                bedrockFace.add("uv", vector(
+                        number(uv, 2) * scaleX,
+                        number(uv, 3) * scaleY));
+                bedrockFace.add("uv_size", vector(
+                        (number(uv, 0) - number(uv, 2)) * scaleX,
+                        (number(uv, 1) - number(uv, 3)) * scaleY));
+            } else {
+                bedrockFace.add("uv", vector(
+                        number(uv, 0) * scaleX,
+                        number(uv, 1) * scaleY));
+                bedrockFace.add("uv_size", vector(
+                        (number(uv, 2) - number(uv, 0)) * scaleX,
+                        (number(uv, 3) - number(uv, 1)) * scaleY));
+            }
             Material material = materials.get(key);
             bedrockFace.addProperty("material_instance",
                     material == null ? materialName(key) : material.name());
@@ -246,11 +283,14 @@ final class JavaModelConverter {
         String axis = rotation.has("axis") ? rotation.get("axis").getAsString() : "y";
         double angle = rotation.has("angle") ? rotation.get("angle").getAsDouble() : 0;
         if (!validVector(origin)) origin = vector(8, 8, 8);
-        cube.add("pivot", vector(number(origin, 0) - 8, number(origin, 1), 8 - number(origin, 2)));
+        cube.add("pivot", vector(
+                -(number(origin, 0) - 8),
+                number(origin, 1),
+                number(origin, 2) - 8));
         double x = 0, y = 0, z = 0;
         switch (axis) {
             case "x" -> x = -angle;
-            case "y" -> y = -angle;
+            case "y" -> y = angle;
             case "z" -> z = angle;
             default -> warnings.add("Unknown Java model rotation axis: " + axis);
         }
@@ -544,11 +584,7 @@ final class JavaModelConverter {
     }
 
     private static String mapFace(String face) {
-        return switch (face) {
-            case "north" -> "south";
-            case "south" -> "north";
-            default -> face;
-        };
+        return face;
     }
 
     private static boolean validVector(JsonArray value) {

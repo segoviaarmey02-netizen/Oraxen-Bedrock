@@ -2,6 +2,7 @@ package dev.oraxenbedrock.conversion;
 
 import com.google.gson.*;
 import dev.oraxenbedrock.config.BridgeConfig;
+import dev.oraxenbedrock.config.GeyserDisplayEntityMappingsWriter;
 import dev.oraxenbedrock.io.PackSource;
 import dev.oraxenbedrock.io.JavaPackMetadata;
 import dev.oraxenbedrock.model.ConversionResult;
@@ -35,6 +36,9 @@ public final class PackConverter {
     public ConversionResult convert(BridgeConfig config) throws IOException {
         List<String> warnings = new ArrayList<>();
         List<OraxenItem> items = new OraxenScanner().scan(config.oraxenDirectory());
+        Map<String, OraxenItem> itemsById = new LinkedHashMap<>();
+        items.forEach(item -> itemsById.put(
+                item.id().toLowerCase(Locale.ROOT), item));
         Path work = dataDirectory.resolve(".work-" + UUID.randomUUID());
         Path bedrock = work.resolve("bedrock");
         Path generated = work.resolve("generated");
@@ -295,7 +299,8 @@ public final class PackConverter {
                             ? itemIconTextures(texture, convertedModel)
                             : guiIconTextures;
                     if (!iconTextures.isEmpty()) {
-                        if (installItemIcon(iconTextures, safeId, bedrockId, bedrock,
+                        if (installBestItemIcon(iconTextures, convertedModel,
+                                guiIconTextures.isEmpty(), safeId, bedrockId, bedrock,
                                 itemTexture, animationConverter, warnings)) {
                             addArrayValue(mappedItems, javaIdentifier(item.material()), definition);
                             mappedItemCount++;
@@ -377,7 +382,8 @@ public final class PackConverter {
                         List<Path> stateTextures =
                                 itemIconTextures(stateFallback, stateModel);
                         if (!stateTextures.isEmpty()) {
-                            if (installItemIcon(stateTextures, stateSafeId, stateBedrockId, bedrock,
+                            if (installBestItemIcon(stateTextures, stateModel, true,
+                                    stateSafeId, stateBedrockId, bedrock,
                                     itemTexture, animationConverter, warnings)) {
                                 addArrayValue(mappedItems, javaIdentifier(item.material()),
                                         stateDefinition);
@@ -394,8 +400,11 @@ public final class PackConverter {
                         }
                     }
 
+                    OraxenItem packModelMappingItem = furnitureDisplayItem(
+                            item, itemsById, warnings);
                     PackModelCounts packModelCounts = convertPackModelVariants(
-                            item, safeId, definition, source, itemModelResolver,
+                            item, packModelMappingItem, safeId, definition,
+                            source, itemModelResolver,
                             modelConverter, equipmentConverter, mappedItems,
                             itemTexture, bedrock, animationConverter,
                             config.namespace(), generatedIdentifiers, warnings);
@@ -528,10 +537,10 @@ public final class PackConverter {
                     if (mappedAnyState) blockCount++;
                 }
 
-                if (item.isFurniture() && (convertedModel == null
-                        || convertedModel.geometry() == null)) {
-                    warnings.add("Decoration '" + item.id()
-                            + "' has no convertible 3D model; Bedrock uses its item icon fallback");
+                if (item.isFurniture()) {
+                    if (convertedModel == null || convertedModel.geometry() == null)
+                        warnings.add("Decoration '" + item.id()
+                                + "' has no convertible 3D model; Bedrock uses its item icon fallback");
                 }
             }
 
@@ -595,6 +604,23 @@ public final class PackConverter {
             atomicInstall(generated.resolve("oraxen-items.json"), itemTarget);
             atomicInstall(generated.resolve("oraxen-blocks.json"), blockTarget);
 
+            GeyserDisplayEntityMappingsWriter.Result displayEntityIntegration = null;
+            List<String> displayFurniture = displayEntityFurniture(items);
+            try {
+                displayEntityIntegration = GeyserDisplayEntityMappingsWriter.write(
+                        config.geyserDirectory(), config.namespace(), items,
+                        mappedBedrockIdentifiers(mappedItems));
+                addDisplayEntityDiagnostics(
+                        displayEntityIntegration, displayFurniture, warnings);
+            } catch (IOException | RuntimeException exception) {
+                if (!displayFurniture.isEmpty())
+                    warnings.add("Could not configure placed DISPLAY_ENTITY furniture "
+                            + displayFurniture + " for GeyserDisplayEntity: "
+                            + exception.getMessage() + ". Stock Geyser cannot render "
+                            + "Java ItemDisplay entities; use ARMOR_STAND furniture until "
+                            + "the extension mapping is fixed");
+            }
+
             List<String> uniqueWarnings = List.copyOf(
                     new LinkedHashSet<>(warnings));
 
@@ -604,7 +630,7 @@ public final class PackConverter {
                     glyphPageCount, languageCount, languageEntryCount,
                     animationConverter.installedAnimations(), validation.checkedReferences(),
                     effectivePackVersion, javaPackMetadata,
-                    uniqueWarnings, packTarget);
+                    uniqueWarnings, packTarget, displayEntityIntegration);
             return new ConversionResult(Instant.now(), mappedItemCount, blockCount, copiedTextures,
                     packTarget, itemTarget, uniqueWarnings);
         } finally {
@@ -1066,6 +1092,22 @@ public final class PackConverter {
         return item.model();
     }
 
+    private OraxenItem furnitureDisplayItem(
+            OraxenItem item, Map<String, OraxenItem> itemsById,
+            List<String> warnings) {
+        if (!item.isFurniture()) return item;
+        String helperId = Maps.string(
+                mechanicSection(item, "furniture"), "item");
+        if (helperId == null || helperId.isBlank()) return item;
+        OraxenItem helper = itemsById.get(
+                helperId.trim().toLowerCase(Locale.ROOT));
+        if (helper != null) return helper;
+        warnings.add("Furniture '" + item.id()
+                + "' references missing display item '" + helperId.trim()
+                + "'; Pack.models states were mapped to the furniture's own material");
+        return item;
+    }
+
     private void applyBlockProperties(OraxenItem item, JsonObject output) {
         Map<String, Object> mechanic = blockMechanic(item);
         Integer light = Maps.integer(mechanic, "light");
@@ -1507,7 +1549,9 @@ public final class PackConverter {
                              int animatedTextureCount, int validatedReferences,
                              int[] effectivePackVersion,
                              JavaPackMetadata javaPackMetadata,
-                             List<String> warnings, Path target) throws IOException {
+                             List<String> warnings, Path target,
+                             GeyserDisplayEntityMappingsWriter.Result displayEntityIntegration)
+            throws IOException {
         JsonObject report = new JsonObject();
         report.addProperty("generated_at", Instant.now().toString());
         report.addProperty("java_pack", config.javaPack().toString());
@@ -1531,10 +1575,80 @@ public final class PackConverter {
         report.addProperty("language_entries", languageEntryCount);
         report.addProperty("animated_textures", animatedTextureCount);
         report.addProperty("validated_references", validatedReferences);
+        if (displayEntityIntegration == null) {
+            report.addProperty("geyser_display_entity_status", "error");
+        } else {
+            report.addProperty("geyser_display_entity_status",
+                    displayEntityIntegration.status().name().toLowerCase(Locale.ROOT));
+            report.addProperty("geyser_display_entity_mappings",
+                    displayEntityIntegration.mappings());
+            report.addProperty("geyser_display_entity_companion_pack",
+                    displayEntityIntegration.companionPackFound());
+            if (displayEntityIntegration.written())
+                report.addProperty("geyser_display_entity_mapping_file",
+                        displayEntityIntegration.file().toString());
+        }
         JsonArray warningArray = new JsonArray();
         warnings.forEach(warningArray::add);
         report.add("warnings", warningArray);
         JsonSupport.write(dataDirectory.resolve("last-report.json"), report);
+    }
+
+    private List<String> displayEntityFurniture(List<OraxenItem> items) {
+        return items.stream().filter(OraxenItem::isFurniture)
+                .filter(item -> {
+                    String type = Maps.string(
+                            mechanicSection(item, "furniture"), "type");
+                    return type == null || type.isBlank()
+                            || type.trim().equalsIgnoreCase("DISPLAY_ENTITY")
+                            || type.trim().replace('-', '_')
+                            .equalsIgnoreCase("DISPLAY_ENTITY");
+                })
+                .map(OraxenItem::id).sorted(String.CASE_INSENSITIVE_ORDER)
+                .toList();
+    }
+
+    private Set<String> mappedBedrockIdentifiers(JsonObject mappedItems) {
+        Set<String> result = new LinkedHashSet<>();
+        collectBedrockIdentifiers(mappedItems, result);
+        return result;
+    }
+
+    private void collectBedrockIdentifiers(JsonElement value, Set<String> output) {
+        if (value == null || value.isJsonNull()) return;
+        if (value.isJsonArray()) {
+            value.getAsJsonArray().forEach(child ->
+                    collectBedrockIdentifiers(child, output));
+            return;
+        }
+        if (!value.isJsonObject()) return;
+        JsonObject object = value.getAsJsonObject();
+        JsonElement identifier = object.get("bedrock_identifier");
+        if (identifier != null && identifier.isJsonPrimitive()
+                && identifier.getAsJsonPrimitive().isString())
+            output.add(identifier.getAsString().trim().toLowerCase(Locale.ROOT));
+        object.entrySet().forEach(entry ->
+                collectBedrockIdentifiers(entry.getValue(), output));
+    }
+
+    private void addDisplayEntityDiagnostics(
+            GeyserDisplayEntityMappingsWriter.Result integration,
+            List<String> furniture, List<String> warnings) {
+        integration.diagnostics().forEach(diagnostic ->
+                warnings.add("GeyserDisplayEntity: " + diagnostic));
+        if (furniture.isEmpty()) return;
+        if (!integration.written()) {
+            warnings.add("Placed DISPLAY_ENTITY furniture " + furniture
+                    + " cannot render for Bedrock with stock Geyser. Install the "
+                    + "GeyserDisplayEntity extension and its companion resource pack, "
+                    + "or change these Oraxen furniture entries to type ARMOR_STAND");
+            return;
+        }
+        if (integration.mappings() > 0 && !integration.companionPackFound())
+            warnings.add("GeyserDisplayEntity mappings were generated for placed furniture "
+                    + furniture + ", but its companion GeyserDisplayEntityPack.mcpack "
+                    + "was not found in the Geyser packs directory. Install that pack and "
+                    + "restart Geyser; otherwise the furniture entities remain invisible");
     }
 
     private JsonObject textureAtlas(String name, String atlas) {
@@ -1574,7 +1688,8 @@ public final class PackConverter {
     }
 
     private PackModelCounts convertPackModelVariants(
-            OraxenItem item, String safeId, JsonObject templateDefinition,
+            OraxenItem item, OraxenItem mappingItem, String safeId,
+            JsonObject templateDefinition,
             PackSource source, JavaItemModelResolver itemModelResolver,
             JavaModelConverter modelConverter,
             EquipmentPreconverter equipmentConverter,
@@ -1609,7 +1724,8 @@ public final class PackConverter {
 
             String modelSafeId = packModelItemId(safeId, key);
             PackModelCounts baseline = convertPackModelDefinition(
-                    item, javaItemModel, modelSafeId, baselineModels, List.of(),
+                    item, mappingItem, javaItemModel, modelSafeId,
+                    baselineModels, List.of(),
                     templateDefinition, source, modelConverter, equipmentConverter,
                     mappedItems, itemTexture, bedrock, animationConverter,
                     outputNamespace, generatedIdentifiers, warnings);
@@ -1627,7 +1743,7 @@ public final class PackConverter {
             for (List<JavaItemModelResolver.Variant> visuals : states.values()) {
                 String stateSafeId = stateItemId(modelSafeId, visuals);
                 PackModelCounts state = convertPackModelDefinition(
-                        item, javaItemModel, stateSafeId,
+                        item, mappingItem, javaItemModel, stateSafeId,
                         visuals.stream().map(JavaItemModelResolver.Variant::model)
                                 .toList(),
                         visuals.get(0).predicates(), templateDefinition, source,
@@ -1643,7 +1759,8 @@ public final class PackConverter {
     }
 
     private PackModelCounts convertPackModelDefinition(
-            OraxenItem item, String javaItemModel, String stateSafeId,
+            OraxenItem item, OraxenItem mappingItem, String javaItemModel,
+            String stateSafeId,
             List<String> visualModels, List<JsonObject> predicates,
             JsonObject templateDefinition, PackSource source,
             JavaModelConverter modelConverter,
@@ -1694,6 +1811,10 @@ public final class PackConverter {
         }
 
         JsonObject definition = templateDefinition.deepCopy();
+        if (mappingItem != item) {
+            definition.remove("components");
+            new ItemComponentConverter().apply(mappingItem, definition);
+        }
         definition.addProperty("type", "definition");
         definition.remove("custom_model_data");
         definition.remove("predicate");
@@ -1725,14 +1846,15 @@ public final class PackConverter {
                     + ") because no icon texture was found");
             return new PackModelCounts(0, geometries, equipment);
         }
-        if (!installItemIcon(iconTextures, stateSafeId, bedrockId, bedrock,
+        if (!installBestItemIcon(iconTextures, convertedModel, true,
+                stateSafeId, bedrockId, bedrock,
                 itemTexture, animationConverter, warnings)) {
             warnings.add("Skipped Pack.models mapping for item '" + item.id()
                     + "' (" + javaItemModel
                     + ") because its icon could not be decoded");
             return new PackModelCounts(0, geometries, equipment);
         }
-        addArrayValue(mappedItems, javaIdentifier(item.material()), definition);
+        addArrayValue(mappedItems, javaIdentifier(mappingItem.material()), definition);
         return new PackModelCounts(1, geometries, equipment);
     }
 
@@ -1756,6 +1878,40 @@ public final class PackConverter {
         if (model != null && !model.materials().isEmpty())
             return List.of(model.materials().values().iterator().next().source());
         return List.of();
+    }
+
+    private boolean installBestItemIcon(
+            List<Path> textures, JavaModelConverter.ConvertedModel model,
+            boolean allowModelThumbnail, String safeId, String bedrockId,
+            Path bedrock, JsonObject itemTexture,
+            TextureAnimationConverter animationConverter,
+            List<String> warnings) throws IOException {
+        if (allowModelThumbnail && model != null && model.geometry() != null
+                && !model.generatedSprite()) {
+            try {
+                BufferedImage rendered = new ModelIconRenderer().render(model);
+                if (rendered != null) {
+                    Path destination = bedrock.resolve("textures/items")
+                            .resolve(safeId + ".png");
+                    Files.createDirectories(destination.getParent());
+                    try (OutputStream output = Files.newOutputStream(destination)) {
+                        if (!ImageIO.write(rendered, "png", output))
+                            throw new IOException("No PNG writer is available for "
+                                    + destination);
+                    }
+                    registerItemIcon(itemTexture, safeId, bedrockId);
+                    return true;
+                }
+                warnings.add("3D inventory thumbnail for '" + bedrockId
+                        + "' was empty; its source texture fallback was used");
+            } catch (IOException | RuntimeException exception) {
+                warnings.add("Could not render 3D inventory thumbnail for '"
+                        + bedrockId + "': " + exception.getMessage()
+                        + "; its source texture fallback was used");
+            }
+        }
+        return installItemIcon(textures, safeId, bedrockId, bedrock,
+                itemTexture, animationConverter, warnings);
     }
 
     private boolean installItemIcon(
