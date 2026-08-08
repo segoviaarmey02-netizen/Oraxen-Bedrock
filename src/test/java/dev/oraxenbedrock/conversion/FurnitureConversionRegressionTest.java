@@ -18,6 +18,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -50,6 +52,8 @@ class FurnitureConversionRegressionTest {
                   Pack:
                     generate_model: false
                     model: default/display_cart
+                    models:
+                      active: default/display_cart_active
                   Components:
                     item_model: oraxen:display_cart
                   Mechanics:
@@ -69,6 +73,11 @@ class FurnitureConversionRegressionTest {
                       "model":"oraxen:default/%s"}}
                     """.formatted(id));
         }
+        write(javaPack.resolve(
+                "assets/oraxen/items/display_cart/active.json"), """
+                {"model":{"type":"minecraft:model",
+                  "model":"oraxen:default/display_cart_active"}}
+                """);
         String model = """
                 {"textures":{"wood":"oraxen:default/furniture_atlas"},
                  "display":{
@@ -88,12 +97,14 @@ class FurnitureConversionRegressionTest {
                 """.formatted(faces(), faces(), faces());
         write(javaPack.resolve("assets/oraxen/models/default/armchair.json"), model);
         write(javaPack.resolve("assets/oraxen/models/default/display_cart.json"), model);
+        write(javaPack.resolve(
+                "assets/oraxen/models/default/display_cart_active.json"), model);
         writeFurnitureTexture(javaPack.resolve(
                 "assets/oraxen/textures/default/furniture_atlas.png"));
 
         Path geyser = temp.resolve("plugins/Geyser-Spigot");
-        Files.createDirectories(geyser.resolve(
-                "extensions/geyserdisplayentity"));
+        writeExtensionJar(geyser.resolve(
+                "extensions/GeyserDisplayEntity.jar"));
         ConversionResult result = new PackConverter(
                 temp.resolve("plugins/OraxenBedrock")).convert(new BridgeConfig(
                 temp, oraxen, geyser, javaPack,
@@ -101,7 +112,7 @@ class FurnitureConversionRegressionTest {
                 true, false, false, false, false, false, false,
                 false, false, 100, false));
 
-        assertEquals(2, result.items());
+        assertEquals(3, result.items());
         assertTrue(result.warnings().stream().anyMatch(warning ->
                 warning.contains("display_cart")
                         && warning.contains("GeyserDisplayEntity")));
@@ -114,6 +125,11 @@ class FurnitureConversionRegressionTest {
         String displayMappingText = Files.readString(displayMappings);
         assertTrue(displayMappingText.contains("display_cart:"));
         assertTrue(displayMappingText.contains("oraxen:display_cart"));
+        assertTrue(displayMappingText.contains(
+                "oraxen:display_cart_model_active_"));
+        assertEquals(2, displayMappingText.lines()
+                .filter(line -> line.trim().startsWith("item-identifier:"))
+                .count());
         assertFalse(displayMappingText.contains("armchair:"));
 
         try (FileSystem pack = FileSystems.newFileSystem(result.pack())) {
@@ -222,5 +238,16 @@ class FurnitureConversionRegressionTest {
     private void write(Path path, String value) throws IOException {
         Files.createDirectories(path.getParent());
         Files.writeString(path, value);
+    }
+
+    private void writeExtensionJar(Path path) throws IOException {
+        Files.createDirectories(path.getParent());
+        try (ZipOutputStream output = new ZipOutputStream(
+                Files.newOutputStream(path))) {
+            output.putNextEntry(new ZipEntry("extension.yml"));
+            output.write("name: Display Support\nid: geyserdisplayentity\n"
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            output.closeEntry();
+        }
     }
 }

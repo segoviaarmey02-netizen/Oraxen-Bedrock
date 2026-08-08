@@ -311,6 +311,7 @@ public final class PackSource implements AutoCloseable {
         Map<String, List<Path>> byBasename = new LinkedHashMap<>();
         for (AssetFile asset : effectiveAssetFiles()) {
             if (!asset.namespace().equals(namespace)
+                    || !asset.relative().startsWith("textures/")
                     || !asset.path().getFileName().toString()
                     .toLowerCase(Locale.ROOT).endsWith(".png")) continue;
             byBasename.computeIfAbsent(

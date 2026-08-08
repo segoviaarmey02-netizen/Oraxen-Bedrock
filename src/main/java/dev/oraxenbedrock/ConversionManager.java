@@ -10,6 +10,8 @@ import java.io.InputStream;
 import java.nio.file.*;
 import java.util.Comparator;
 import java.util.zip.CRC32;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 import java.util.stream.Stream;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -134,13 +136,21 @@ final class ConversionManager {
         value = fingerprintPath(current.oraxenDirectory().resolve("glyphs"), value);
         value = fingerprintPath(current.oraxenDirectory().resolve("sound.yml"), value);
         value = fingerprintPath(current.oraxenDirectory().resolve("sounds.yml"), value);
-        Path sourcePack = current.oraxenDirectory().resolve("pack").normalize();
-        // Oraxen rewrites pack.zip on every startup even when its content is
-        // unchanged, so the archive itself must not count as an input change.
-        value = fingerprintPath(sourcePack, value, current.javaPack());
-        if (!current.javaPack().toAbsolutePath().normalize()
-                .startsWith(sourcePack.toAbsolutePath().normalize()))
-            value = fingerprintPath(current.javaPack(), value);
+        Path sourcePack = current.oraxenDirectory().resolve("pack")
+                .toAbsolutePath().normalize();
+        Path configuredPack = current.javaPack().toAbsolutePath().normalize();
+        boolean packInsideSource = configuredPack.startsWith(sourcePack);
+        // Exclude the archive from the flat source scan and fingerprint its
+        // logical ZIP entries separately. Oraxen can repackage identical files
+        // on every startup, changing ZIP metadata and compressed bytes without
+        // changing the resource pack that the converter sees.
+        value = fingerprintPath(sourcePack, value,
+                packInsideSource && Files.isRegularFile(configuredPack)
+                        ? configuredPack : null);
+        if (Files.isRegularFile(configuredPack))
+            value = fingerprintPack(configuredPack, value);
+        else if (!packInsideSource)
+            value = fingerprintPath(configuredPack, value);
         value = fingerprintPath(dataDirectory.resolve("overrides"), value);
         return value;
     }
@@ -212,6 +222,45 @@ final class ConversionManager {
         long hash = seed * 31 + relative.hashCode();
         hash = hash * 31 + Files.size(file);
         return hash * 31 + crc.getValue();
+    }
+
+    private static long fingerprintPack(Path pack, long seed) {
+        try (ZipFile zip = new ZipFile(pack.toFile())) {
+            var entries = zip.stream()
+                    .filter(entry -> !entry.isDirectory())
+                    .sorted(Comparator
+                            .comparing(ConversionManager::zipEntryName)
+                            .thenComparingLong(ZipEntry::getSize)
+                            .thenComparingLong(ZipEntry::getCrc))
+                    .toList();
+            long hash = seed * 31 + 0x5A49504CL;
+            hash = hash * 31 + entries.size();
+            byte[] buffer = new byte[8192];
+            for (ZipEntry entry : entries) {
+                CRC32 crc = new CRC32();
+                long size = 0;
+                try (InputStream input = zip.getInputStream(entry)) {
+                    int read;
+                    while ((read = input.read(buffer)) != -1) {
+                        crc.update(buffer, 0, read);
+                        size += read;
+                    }
+                }
+                hash = hash * 31 + zipEntryName(entry).hashCode();
+                hash = hash * 31 + size;
+                hash = hash * 31 + crc.getValue();
+            }
+            return hash;
+        } catch (IOException | RuntimeException exception) {
+            // A partially-written or non-ZIP configured file must still affect
+            // the debounce fingerprint. The next stable readable ZIP will use
+            // the logical-entry path above.
+            return fingerprintPath(pack, seed);
+        }
+    }
+
+    private static String zipEntryName(ZipEntry entry) {
+        return entry.getName().replace('\\', '/');
     }
 
     private String errorMessage(Exception exception) {

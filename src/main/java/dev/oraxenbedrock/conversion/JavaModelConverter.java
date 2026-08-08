@@ -86,8 +86,8 @@ final class JavaModelConverter {
         for (JsonElement elementValue : modelElements) {
             if (!elementValue.isJsonObject()) continue;
             JsonObject element = elementValue.getAsJsonObject();
-            JsonArray from = element.getAsJsonArray("from");
-            JsonArray to = element.getAsJsonArray("to");
+            JsonArray from = array(element.get("from"));
+            JsonArray to = array(element.get("to"));
             if (!validVector(from) || !validVector(to)) {
                 warnings.add("Skipped element without valid from/to in " + model);
                 continue;
@@ -104,13 +104,16 @@ final class JavaModelConverter {
             JsonObject cube = new JsonObject();
             cube.add("origin", vector(originX, originY, originZ));
             cube.add("size", vector(sizeX, sizeY, sizeZ));
-            if (element.has("rotation") && element.get("rotation").isJsonObject())
-                addRotation(cube, element.getAsJsonObject("rotation"), warnings);
-            JsonObject faces = element.getAsJsonObject("faces");
+            JsonElement rotation = element.get("rotation");
+            if (rotation != null && rotation.isJsonObject())
+                addRotation(cube, rotation.getAsJsonObject(), warnings);
+            else if (rotation != null && !rotation.isJsonNull())
+                warnings.add("Ignored malformed element rotation in " + model);
+            JsonObject faces = object(element.get("faces"));
             if (faces != null)
                 cube.add("uv", convertFaces(
                         faces, resolved.textures, materials, from, to,
-                        textureWidth, textureHeight));
+                        textureWidth, textureHeight, warnings, model));
             cubes.add(cube);
             minX = Math.min(minX, originX);
             minY = Math.min(minY, originY);
@@ -170,25 +173,51 @@ final class JavaModelConverter {
         }
         JsonObject json = JsonSupport.readObject(path);
         Resolved parent = null;
-        if (json.has("parent")) {
-            String parentName = normalizeParent(json.get("parent").getAsString());
-            if (!BUILTIN_PARENTS.contains(parentName)) parent = resolve(parentName, chain, warnings);
-            else parent = builtinModel(parentName);
+        JsonElement parentValue = json.get("parent");
+        if (parentValue != null && !parentValue.isJsonNull()) {
+            String parentReference = string(parentValue);
+            if (parentReference == null || parentReference.isBlank()) {
+                warnings.add("Ignored malformed Java model parent in " + model);
+            } else {
+                String parentName = normalizeParent(parentReference);
+                if (!BUILTIN_PARENTS.contains(parentName))
+                    parent = resolve(parentName, chain, warnings);
+                else parent = builtinModel(parentName);
+            }
         }
         Map<String, String> textures = parent == null
                 ? new LinkedHashMap<>() : new LinkedHashMap<>(parent.textures);
-        JsonObject textureJson = json.getAsJsonObject("textures");
-        if (textureJson != null) textureJson.entrySet().forEach(e -> {
-            if (e.getValue().isJsonPrimitive()) textures.put(e.getKey(), e.getValue().getAsString());
-        });
-        JsonArray elements = json.has("elements") ? json.getAsJsonArray("elements")
+        JsonElement textureValue = json.get("textures");
+        JsonObject textureJson = object(textureValue);
+        if (textureJson != null) {
+            for (Map.Entry<String, JsonElement> entry : textureJson.entrySet()) {
+                String reference = string(entry.getValue());
+                if (reference == null || reference.isBlank()) {
+                    warnings.add("Ignored malformed texture '" + entry.getKey()
+                            + "' in " + model);
+                    continue;
+                }
+                textures.put(entry.getKey(), reference);
+            }
+        } else if (textureValue != null && !textureValue.isJsonNull()) {
+            warnings.add("Ignored non-object textures section in " + model);
+        }
+        JsonElement elementValue = json.get("elements");
+        JsonArray ownElements = array(elementValue);
+        JsonArray elements = ownElements != null ? ownElements
                 : parent == null ? new JsonArray() : parent.elements.deepCopy();
+        if (elementValue != null && !elementValue.isJsonNull()
+                && ownElements == null)
+            warnings.add("Ignored non-array elements section in " + model);
         JsonObject display = parent == null
                 ? new JsonObject() : parent.display.deepCopy();
-        JsonObject ownDisplay = json.getAsJsonObject("display");
+        JsonElement displayValue = json.get("display");
+        JsonObject ownDisplay = object(displayValue);
         if (ownDisplay != null)
             ownDisplay.entrySet().forEach(entry ->
                     display.add(entry.getKey(), entry.getValue().deepCopy()));
+        else if (displayValue != null && !displayValue.isJsonNull())
+            warnings.add("Ignored non-object display section in " + model);
         chain.remove(model);
         return new Resolved(textures, elements, display,
                 parent != null && parent.handheld);
@@ -236,17 +265,40 @@ final class JavaModelConverter {
     private JsonObject convertFaces(JsonObject faces, Map<String, String> textures,
                                     Map<String, Material> materials,
                                     JsonArray from, JsonArray to,
-                                    int textureWidth, int textureHeight) {
+                                    int textureWidth, int textureHeight,
+                                    List<String> warnings, String model) {
         JsonObject result = new JsonObject();
         double scaleX = textureWidth / 16.0;
         double scaleY = textureHeight / 16.0;
         for (Map.Entry<String, JsonElement> entry : faces.entrySet()) {
+            if (!isFace(entry.getKey())) {
+                warnings.add("Ignored unknown face '" + entry.getKey()
+                        + "' in " + model);
+                continue;
+            }
             if (!entry.getValue().isJsonObject()) continue;
             JsonObject javaFace = entry.getValue().getAsJsonObject();
-            String texture = javaFace.has("texture") ? javaFace.get("texture").getAsString() : "#all";
+            String texture = javaFace.has("texture")
+                    ? string(javaFace.get("texture")) : "#all";
+            if (texture == null || texture.isBlank()) {
+                warnings.add("Skipped " + entry.getKey()
+                        + " face with malformed texture in " + model);
+                continue;
+            }
             String key = texture.startsWith("#") ? texture.substring(1) : findTextureKey(texture, textures);
-            JsonArray uv = javaFace.getAsJsonArray("uv");
-            if (!validUv(uv)) uv = defaultUv(entry.getKey(), from, to);
+            Material material = materials.get(key);
+            if (material == null) {
+                warnings.add("Skipped " + entry.getKey() + " face with unresolved texture '"
+                        + texture + "' in " + model);
+                continue;
+            }
+            JsonArray uv = array(javaFace.get("uv"));
+            if (!validUv(uv)) {
+                if (javaFace.has("uv"))
+                    warnings.add("Used default UV for malformed " + entry.getKey()
+                            + " face in " + model);
+                uv = defaultUv(entry.getKey(), from, to);
+            }
             JsonObject bedrockFace = new JsonObject();
             boolean horizontal = entry.getKey().equals("up")
                     || entry.getKey().equals("down");
@@ -268,20 +320,32 @@ final class JavaModelConverter {
                         (number(uv, 2) - number(uv, 0)) * scaleX,
                         (number(uv, 3) - number(uv, 1)) * scaleY));
             }
-            Material material = materials.get(key);
-            bedrockFace.addProperty("material_instance",
-                    material == null ? materialName(key) : material.name());
-            if (javaFace.has("rotation"))
-                bedrockFace.addProperty("uv_rotation", javaFace.get("rotation").getAsInt());
+            bedrockFace.addProperty("material_instance", material.name());
+            JsonElement rotation = javaFace.get("rotation");
+            if (rotation != null && isNumber(rotation))
+                bedrockFace.addProperty("uv_rotation", rotation.getAsInt());
+            else if (rotation != null && !rotation.isJsonNull())
+                warnings.add("Ignored malformed UV rotation on " + entry.getKey()
+                        + " face in " + model);
             result.add(mapFace(entry.getKey()), bedrockFace);
         }
         return result;
     }
 
     private void addRotation(JsonObject cube, JsonObject rotation, List<String> warnings) {
-        JsonArray origin = rotation.getAsJsonArray("origin");
-        String axis = rotation.has("axis") ? rotation.get("axis").getAsString() : "y";
-        double angle = rotation.has("angle") ? rotation.get("angle").getAsDouble() : 0;
+        JsonArray origin = array(rotation.get("origin"));
+        String configuredAxis = string(rotation.get("axis"));
+        String axis = configuredAxis == null ? "y"
+                : configuredAxis.toLowerCase(Locale.ROOT);
+        if (rotation.has("axis") && configuredAxis == null)
+            warnings.add("Ignored malformed Java model rotation axis");
+        JsonElement angleValue = rotation.get("angle");
+        boolean validAngle = isNumber(angleValue)
+                && Double.isFinite(angleValue.getAsDouble());
+        double angle = validAngle ? angleValue.getAsDouble() : 0;
+        if (angleValue != null && !angleValue.isJsonNull()
+                && !validAngle)
+            warnings.add("Ignored malformed Java model rotation angle");
         if (!validVector(origin)) origin = vector(8, 8, 8);
         cube.add("pivot", vector(
                 -(number(origin, 0) - 8),
@@ -295,8 +359,15 @@ final class JavaModelConverter {
             default -> warnings.add("Unknown Java model rotation axis: " + axis);
         }
         cube.add("rotation", vector(x, y, z));
-        if (rotation.has("rescale") && rotation.get("rescale").getAsBoolean())
+        JsonElement rescale = rotation.get("rescale");
+        if (rescale != null && rescale.isJsonPrimitive()
+                && rescale.getAsJsonPrimitive().isBoolean()
+                && rescale.getAsBoolean())
             rescaleCube(cube, axis, angle, warnings);
+        else if (rescale != null && !rescale.isJsonNull()
+                && (!rescale.isJsonPrimitive()
+                || !rescale.getAsJsonPrimitive().isBoolean()))
+            warnings.add("Ignored malformed Java model rescale flag");
     }
 
     private void rescaleCube(
@@ -511,11 +582,12 @@ final class JavaModelConverter {
         Path metadata = texture.resolveSibling(texture.getFileName() + ".mcmeta");
         if (!Files.isRegularFile(metadata)) return new int[]{imageWidth, imageHeight};
         try {
-            JsonObject animation = JsonSupport.readObject(metadata).getAsJsonObject("animation");
+            JsonObject animation = object(
+                    JsonSupport.readObject(metadata).get("animation"));
             if (animation == null) return new int[]{imageWidth, imageHeight};
-            int width = animation.has("width")
+            int width = isNumber(animation.get("width"))
                     ? animation.get("width").getAsInt() : imageWidth;
-            int height = animation.has("height")
+            int height = isNumber(animation.get("height"))
                     ? animation.get("height").getAsInt() : width;
             if (width > 0 && height > 0) return new int[]{width, height};
         } catch (IOException | RuntimeException ignored) {
@@ -588,15 +660,53 @@ final class JavaModelConverter {
     }
 
     private static boolean validVector(JsonArray value) {
-        return value != null && value.size() >= 3;
+        return validNumbers(value, 3);
     }
 
     private static boolean validUv(JsonArray value) {
-        return value != null && value.size() >= 4;
+        return validNumbers(value, 4);
     }
 
     private static double number(JsonArray value, int index) {
         return value.get(index).getAsDouble();
+    }
+
+    private static boolean validNumbers(JsonArray value, int count) {
+        if (value == null || value.size() < count) return false;
+        for (int index = 0; index < count; index++) {
+            JsonElement element = value.get(index);
+            if (!isNumber(element)
+                    || !Double.isFinite(element.getAsDouble())) return false;
+        }
+        return true;
+    }
+
+    private static boolean isNumber(JsonElement value) {
+        return value != null && value.isJsonPrimitive()
+                && value.getAsJsonPrimitive().isNumber();
+    }
+
+    private static JsonArray array(JsonElement value) {
+        return value != null && value.isJsonArray()
+                ? value.getAsJsonArray() : null;
+    }
+
+    private static JsonObject object(JsonElement value) {
+        return value != null && value.isJsonObject()
+                ? value.getAsJsonObject() : null;
+    }
+
+    private static String string(JsonElement value) {
+        return value != null && value.isJsonPrimitive()
+                && value.getAsJsonPrimitive().isString()
+                ? value.getAsString() : null;
+    }
+
+    private static boolean isFace(String value) {
+        return switch (value) {
+            case "down", "up", "north", "south", "west", "east" -> true;
+            default -> false;
+        };
     }
 
     private static JsonArray vector(double... values) {

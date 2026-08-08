@@ -22,6 +22,9 @@ generation.
 
 The converter reads Oraxen YAML plus its generated `pack/pack.zip`. Wrapped
 ZIP exports and Oraxen's uncompressed flat `pack/` folders are detected too.
+Pack-change detection fingerprints normalized ZIP entries rather than archive
+timestamps or entry order, so equivalent Oraxen repacks are ignored while an
+actual changed asset still triggers conversion.
 It supports regular 2D items, generated cube/cutout blocks, Oraxen note/string/
 chorus/shaped block states, named sounds, bitmap fonts/emojis, localizations,
 pack icons, and namespaced GUI texture transfer. Java block states are
@@ -56,7 +59,9 @@ Bedrock geometry, icons and state-dependent variants.
 Current Oraxen `Pack.models` entries are converted into independent Geyser
 definitions too. Furniture jukebox states, inline plant stages and other named
 models such as `oraxen:item_id/active` therefore retain their own icon,
-geometry and attachable. `Pack.gui_model` display-context branches are used for
+geometry and attachable. Every generated display-entity furniture state also
+gets an exact GeyserDisplayEntity item mapping instead of only mapping the base
+item. `Pack.gui_model` display-context branches are used for
 the Bedrock inventory icon while the normal fallback model remains the held
 3D model, which preserves the intended split for custom swords and tools.
 When no dedicated GUI sprite exists, cube-based 3D furniture and items are
@@ -146,7 +151,9 @@ texture-size-aware UV scaling, and the common `cube_all`, `cube_column`,
 `orientable`, `cross`, leaves and trapdoor template parents. Java
 first-person, third-person and head `display` transforms are translated into
 Bedrock attachable animations, preserving item rotation, translation and scale
-while held or equipped.
+while held or equipped. A malformed model section, element, face, UV or texture
+reference is isolated to the affected item/model part and reported instead of
+aborting conversion of the whole pack.
 
 Oraxen shaped blocks are resolved per Java block state rather than flattened to
 one model. Stairs retain straight, inner and outer corner geometry; doors retain
@@ -180,7 +187,12 @@ durability, stack size, cooldown, enchantable, tool and repair data,
 copied to item mappings. Oraxen's advanced durability object, friendly
 tool-rule fields (`material`, `materials`, `tag`, `tags`), consumable effects,
 sound identifiers, cooldown groups and repair holder sets are normalized to
-the vanilla component structures expected by Geyser.
+the vanilla component structures expected by Geyser. Explicit component
+removals, including `consumable: false` and `!minecraft:...` keys, use Geyser's
+removal syntax so inherited vanilla behavior is not left active. Modern
+custom-model-data predicates receive Java's default index, resource-location
+selector values are normalized, and legacy parent/child override precedence is
+preserved.
 
 Block light emission, light dampening, hardness and friction are carried into
 custom block state overrides. Mechanic names are matched case-insensitively,
@@ -196,7 +208,9 @@ non-fatal approximations are written to `last-report.json`.
 An input with no discoverable Java assets, a configured custom-item set that
 produces no mappings, or an output containing only pack scaffolding is rejected
 before installation, so a valid existing Bedrock pack is never replaced by an
-empty one.
+empty one. The pack and both Geyser mapping files are staged and installed as
+one transaction; if any commit step fails, the complete previous set is
+restored.
 
 Minecraft Java shaders and the exact placement/animation behavior of runtime
 display-entity furniture have no lossless Bedrock resource-pack equivalent.

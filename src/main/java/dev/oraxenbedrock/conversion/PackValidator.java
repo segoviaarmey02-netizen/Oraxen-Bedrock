@@ -9,6 +9,7 @@ import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.regex.Matcher;
@@ -32,6 +33,62 @@ final class PackValidator {
 
     record Result(int checkedReferences, List<String> warnings) {}
 
+    static boolean hasUsableItemMappings(JsonObject mappedItems) {
+        if (mappedItems == null) return false;
+        for (JsonElement definitions : mappedItems.asMap().values()) {
+            if (!definitions.isJsonArray()) continue;
+            for (JsonElement value : definitions.getAsJsonArray())
+                if (isUsableItemDefinition(value, null)) return true;
+        }
+        return false;
+    }
+
+    private static boolean isUsableItemDefinition(
+            JsonElement value, String inheritedModel) {
+        if (!value.isJsonObject()) return false;
+        JsonObject definition = value.getAsJsonObject();
+        String type = optionalString(definition.get("type"));
+        if (definition.has("type") && type == null) return false;
+        if (type == null) type = "definition";
+        if (type.equals("group")) {
+            String localModel = optionalString(definition.get("model"));
+            if (definition.has("model") && localModel == null) return false;
+            String effectiveModel = localModel == null ? inheritedModel : localModel;
+            JsonElement nested = definition.get("definitions");
+            if (nested == null || !nested.isJsonArray()
+                    || nested.getAsJsonArray().isEmpty()) return false;
+            for (JsonElement child : nested.getAsJsonArray())
+                if (isUsableItemDefinition(child, effectiveModel)) return true;
+            return false;
+        }
+        if (!type.equals("definition") && !type.equals("legacy")) return false;
+        if (optionalString(definition.get("bedrock_identifier")) == null)
+            return false;
+        if (type.equals("legacy")) {
+            JsonElement customModelData = definition.get("custom_model_data");
+            return isFiniteNumber(customModelData);
+        }
+        String localModel = optionalString(definition.get("model"));
+        if (definition.has("model") && localModel == null) return false;
+        return localModel != null || inheritedModel != null;
+    }
+
+    private static String optionalString(JsonElement value) {
+        return value != null && value.isJsonPrimitive()
+                && value.getAsJsonPrimitive().isString()
+                && !value.getAsString().isBlank() ? value.getAsString() : null;
+    }
+
+    private static boolean isFiniteNumber(JsonElement value) {
+        if (value == null || !value.isJsonPrimitive()
+                || !value.getAsJsonPrimitive().isNumber()) return false;
+        try {
+            return Double.isFinite(value.getAsDouble());
+        } catch (NumberFormatException exception) {
+            return false;
+        }
+    }
+
     Result validate(Path bedrock, JsonObject itemMappings,
                     JsonObject blockMappings, String generatedNamespace) throws IOException {
         for (String required : List.of("manifest.json", "textures/item_texture.json",
@@ -43,22 +100,25 @@ final class PackValidator {
         List<String> warnings = new ArrayList<>();
         int checked = 0;
         Set<String> ids = new HashSet<>();
-        JsonObject mapped = itemMappings.getAsJsonObject("items");
-        if (mapped != null) for (Map.Entry<String, JsonElement> mapping
-                : mapped.entrySet()) {
+        JsonElement mappedValue = itemMappings.get("items");
+        if (mappedValue == null || !mappedValue.isJsonObject())
+            throw new IOException("Item mappings have no items object");
+        JsonObject mapped = mappedValue.getAsJsonObject();
+        for (Map.Entry<String, JsonElement> mapping : mapped.entrySet()) {
             JsonElement definitions = mapping.getValue();
-            if (!definitions.isJsonArray()) continue;
+            if (!definitions.isJsonArray())
+                throw new IOException("Item mapping '" + mapping.getKey()
+                        + "' definitions must be an array");
+            if (definitions.getAsJsonArray().isEmpty())
+                throw new IOException("Item mapping '" + mapping.getKey()
+                        + "' has no definitions");
+            int definitionIndex = 0;
             for (JsonElement value : definitions.getAsJsonArray()) {
-                if (!value.isJsonObject()) continue;
-                JsonObject definition = value.getAsJsonObject();
-                String id = string(definition.get("bedrock_identifier"));
-                String context = id == null ? mapping.getKey() : id;
-                if (id != null) {
-                    if (!ids.add(id)) throw new IOException(
-                            "Duplicate generated Bedrock item identifier: " + id);
-                    checked++;
-                }
-                checked += validatePredicates(definition, context, warnings);
+                checked += validateItemDefinition(value, null,
+                        "Item mapping '" + mapping.getKey() + "' definition "
+                                + definitionIndex,
+                        ids, warnings);
+                definitionIndex++;
             }
         }
 
@@ -73,6 +133,73 @@ final class PackValidator {
         checked += validateSounds(bedrock, warnings);
         checked += validateFonts(bedrock);
         return new Result(checked, List.copyOf(warnings));
+    }
+
+    private int validateItemDefinition(
+            JsonElement value, String inheritedModel, String context,
+            Set<String> ids, List<String> warnings) throws IOException {
+        if (!value.isJsonObject())
+            throw new IOException(context + " is not an object");
+        JsonObject definition = value.getAsJsonObject();
+        String type = definitionType(definition, context);
+        if (type.equals("group")) {
+            String localModel = optionalDefinitionString(
+                    definition, "model", context, false);
+            String effectiveModel = localModel == null ? inheritedModel : localModel;
+            JsonElement nested = definition.get("definitions");
+            if (nested == null || !nested.isJsonArray())
+                throw new IOException(context + " group definitions must be an array");
+            if (nested.getAsJsonArray().isEmpty())
+                throw new IOException(context + " group has no definitions");
+            int checked = 0;
+            int index = 0;
+            for (JsonElement child : nested.getAsJsonArray()) {
+                checked += validateItemDefinition(child, effectiveModel,
+                        context + ".definitions[" + index + "]", ids, warnings);
+                index++;
+            }
+            return checked;
+        }
+
+        String id = optionalDefinitionString(
+                definition, "bedrock_identifier", context, true);
+        if (!ids.add(id)) throw new IOException(
+                "Duplicate generated Bedrock item identifier: " + id);
+        if (type.equals("legacy")) {
+            JsonElement customModelData = definition.get("custom_model_data");
+            if (!isFiniteNumber(customModelData))
+                throw new IOException(context
+                        + " legacy definition requires finite numeric custom_model_data");
+        } else {
+            String localModel = optionalDefinitionString(
+                    definition, "model", context, false);
+            if (localModel == null && inheritedModel == null)
+                throw new IOException(context
+                        + " definition requires model");
+        }
+        return 1 + validatePredicates(definition, id, warnings);
+    }
+
+    private String definitionType(JsonObject definition, String context)
+            throws IOException {
+        if (!definition.has("type")) return "definition";
+        String type = optionalDefinitionString(
+                definition, "type", context, true);
+        if (!Set.of("definition", "legacy", "group").contains(type))
+            throw new IOException(context + " has unsupported type: " + type);
+        return type;
+    }
+
+    private String optionalDefinitionString(
+            JsonObject definition, String field, String context,
+            boolean required) throws IOException {
+        JsonElement value = definition.get(field);
+        if (value == null && !required) return null;
+        String result = optionalString(value);
+        if (result == null)
+            throw new IOException(context + (required ? " requires " : " has invalid ")
+                    + field);
+        return result;
     }
 
     private int validateFonts(Path bedrock) throws IOException {
@@ -111,19 +238,37 @@ final class PackValidator {
         int checked = 0;
         for (Map.Entry<String, JsonElement> mapping : items.entrySet()) {
             if (!mapping.getValue().isJsonArray()) continue;
-            for (JsonElement value : mapping.getValue().getAsJsonArray()) {
-                if (!value.isJsonObject()) continue;
-                JsonObject options = value.getAsJsonObject()
-                        .getAsJsonObject("bedrock_options");
-                String icon = options == null ? null : string(options.get("icon"));
-                if (icon == null) continue;
-                checked++;
-                if (!atlas.has(icon))
-                    throw new IOException("Item mapping '" + mapping.getKey()
-                            + "' references missing icon shorthand: " + icon);
-            }
+            for (JsonElement value : mapping.getValue().getAsJsonArray())
+                checked += validateItemDefinitionIcons(
+                        value, atlas, "Item mapping '" + mapping.getKey() + "'");
         }
         return checked;
+    }
+
+    private int validateItemDefinitionIcons(
+            JsonElement value, JsonObject atlas, String context) throws IOException {
+        if (!value.isJsonObject()) return 0;
+        JsonObject definition = value.getAsJsonObject();
+        if ("group".equals(optionalString(definition.get("type")))) {
+            JsonArray nested = definition.getAsJsonArray("definitions");
+            int checked = 0;
+            for (JsonElement child : nested)
+                checked += validateItemDefinitionIcons(child, atlas, context);
+            return checked;
+        }
+        JsonElement optionsValue = definition.get("bedrock_options");
+        if (optionsValue == null) return 0;
+        if (!optionsValue.isJsonObject())
+            throw new IOException(context + " bedrock_options is not an object");
+        JsonObject options = optionsValue.getAsJsonObject();
+        if (!options.has("icon")) return 0;
+        String icon = optionalString(options.get("icon"));
+        if (icon == null)
+            throw new IOException(context + " has invalid icon shorthand");
+        if (!atlas.has(icon))
+            throw new IOException(context
+                    + " references missing icon shorthand: " + icon);
+        return 1;
     }
 
     private int validateBlockMappings(JsonObject blockMappings) throws IOException {
@@ -268,13 +413,16 @@ final class PackValidator {
             if (textures != null && !textures.isJsonArray())
                 warnings.add(file + " entry '" + entry.getKey()
                         + "' should use a textures array");
-            List<String> texturePaths = strings(textures);
+            List<String> texturePaths = atlasTexturePaths(
+                    textures, file, entry.getKey());
             if (texturePaths.isEmpty())
                 throw new IOException(file + " entry '" + entry.getKey()
                         + "' has no texture paths");
             for (String texture : texturePaths) {
                 checked++;
-                if (!texture.startsWith("textures/")) continue;
+                if (!validTextureResourcePath(texture))
+                    throw new IOException("Invalid texture resource path referenced by "
+                            + file + " entry '" + entry.getKey() + "': " + texture);
                 Path png = texturePath(bedrock, texture);
                 if (png == null || !Files.isRegularFile(png))
                     throw new IOException(
@@ -660,15 +808,43 @@ final class PackValidator {
         return resolved.startsWith(normalizedRoot) ? resolved : null;
     }
 
-    private List<String> strings(JsonElement value) {
-        if (value == null) return List.of();
+    private List<String> atlasTexturePaths(
+            JsonElement value, String file, String entry) throws IOException {
+        if (value == null || value.isJsonNull()) return List.of();
         if (value.isJsonArray()) {
             List<String> output = new ArrayList<>();
-            for (JsonElement child : value.getAsJsonArray())
-                if (child.isJsonPrimitive()) output.add(child.getAsString());
+            int index = 0;
+            for (JsonElement child : value.getAsJsonArray()) {
+                if (!child.isJsonPrimitive()
+                        || !child.getAsJsonPrimitive().isString())
+                    throw new IOException(file + " entry '" + entry
+                            + "' texture path " + index + " is not a string");
+                output.add(child.getAsString());
+                index++;
+            }
             return output;
         }
-        return value.isJsonPrimitive() ? List.of(value.getAsString()) : List.of();
+        if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString())
+            throw new IOException(file + " entry '" + entry
+                    + "' textures must be a string or array of strings");
+        return List.of(value.getAsString());
+    }
+
+    private boolean validTextureResourcePath(String texture) {
+        if (texture == null || texture.isBlank()
+                || !texture.startsWith("textures/")
+                || texture.indexOf('\\') >= 0 || texture.indexOf(':') >= 0)
+            return false;
+        String[] segments = texture.split("/", -1);
+        if (segments.length < 2) return false;
+        for (String segment : segments)
+            if (segment.isBlank() || segment.equals(".") || segment.equals(".."))
+                return false;
+        try {
+            return !Path.of(texture).isAbsolute();
+        } catch (InvalidPathException exception) {
+            return false;
+        }
     }
 
     private String string(JsonElement value) {

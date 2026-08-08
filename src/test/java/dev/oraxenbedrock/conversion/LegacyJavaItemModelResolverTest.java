@@ -123,6 +123,71 @@ class LegacyJavaItemModelResolverTest {
         }
     }
 
+    @Test
+    void outerStateOverrideWinsOverBaselineChildOverride() throws Exception {
+        writeModel("item/root", """
+                {"overrides":[
+                  {"predicate":{"custom_model_data":10},
+                   "model":"oraxen:item/selected"},
+                  {"predicate":{"custom_model_data":10,"damaged":1},
+                   "model":"oraxen:item/outer_damaged"}
+                ]}
+                """);
+        writeModel("item/selected", """
+                {"overrides":[
+                  {"predicate":{"damaged":1},
+                   "model":"oraxen:item/child_damaged"}
+                ]}
+                """);
+
+        try (PackSource source = PackSource.open(temp)) {
+            LegacyJavaItemModelResolver.Result result =
+                    new LegacyJavaItemModelResolver(source, "oraxen")
+                            .resolve("oraxen:item/root", 10);
+
+            assertEquals("oraxen:item/selected", result.model());
+            assertEquals(1, result.variants().size());
+            assertEquals("oraxen:item/outer_damaged",
+                    result.variants().get(0).model(),
+                    "Selecting an override in the outer model prevents the "
+                            + "baseline child's override from being evaluated");
+            assertPredicate(result.variants().get(0).predicates().get(0),
+                    "condition", "damaged");
+        }
+    }
+
+    @Test
+    void deduplicatesEquivalentPredicatesRegardlessOfSourceKeyOrder()
+            throws Exception {
+        writeModel("item/ordered", """
+                {"overrides":[
+                  {"predicate":{"custom_model_data":10},
+                   "model":"oraxen:item/base"},
+                  {"predicate":{"custom_model_data":10,"damaged":1,"damage":0.5},
+                   "model":"oraxen:item/first"},
+                  {"predicate":{"damage":0.5,"damaged":1,"custom_model_data":10},
+                   "model":"oraxen:item/last"},
+                  {"predicate":{"custom_model_data":10,"damage":1.1},
+                   "model":"oraxen:item/impossible"}
+                ]}
+                """);
+
+        try (PackSource source = PackSource.open(temp)) {
+            LegacyJavaItemModelResolver.Result result =
+                    new LegacyJavaItemModelResolver(source, "oraxen")
+                            .resolve("oraxen:item/ordered", 10);
+
+            assertEquals("oraxen:item/base", result.model());
+            assertEquals(1, result.variants().size());
+            assertEquals("oraxen:item/last", result.variants().get(0).model(),
+                    "Java's last matching override must win even when JSON key "
+                            + "order differs");
+            assertEquals(2, result.variants().get(0).predicates().size());
+            assertFalse(result.variants().stream()
+                    .anyMatch(variant -> variant.model().endsWith("impossible")));
+        }
+    }
+
     private JavaItemModelResolver.Variant variant(
             List<JavaItemModelResolver.Variant> variants, String model) {
         return variants.stream().filter(value -> value.model().equals(model))

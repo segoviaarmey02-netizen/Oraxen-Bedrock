@@ -26,26 +26,53 @@ final class ItemComponentConverter {
 
     void apply(OraxenItem item, JsonObject definition) {
         JsonObject output = definition.has("components")
+                && definition.get("components").isJsonObject()
                 ? definition.getAsJsonObject("components") : new JsonObject();
         for (Map.Entry<String, Object> entry : item.components().entrySet()) {
-            String key = entry.getKey().toLowerCase(Locale.ROOT);
+            String key = entry.getKey().trim().toLowerCase(Locale.ROOT);
+            boolean remove = key.startsWith("!");
+            if (remove) key = key.substring(1);
             if (key.startsWith("minecraft:")) key = key.substring("minecraft:".length());
+            if (key.startsWith("!")) {
+                remove = true;
+                key = key.substring(1);
+            }
+            key = key.replace('-', '_');
             // Oraxen exposes this component under its historical user-facing
             // name while Geyser expects the vanilla data-component name.
             if (key.equals("durability")) {
                 key = "max_damage";
+                if (remove) {
+                    putRemoval(output, key);
+                    continue;
+                }
                 Object durability = entry.getValue();
                 if (durability instanceof Map<?, ?> map) durability = mapValue(map, "value");
                 Integer parsed = integer(durability);
-                if (parsed != null) output.addProperty("minecraft:max_damage", parsed);
+                if (parsed != null && parsed > 0)
+                    putComponent(output, key, new JsonPrimitive(parsed));
                 continue;
             }
             if (!SUPPORTED.contains(key)) continue;
+            if (remove) {
+                putRemoval(output, key);
+                continue;
+            }
             JsonElement value = JsonSupport.GSON.toJsonTree(entry.getValue());
             value = normalize(key, value);
-            if (value != null) output.add("minecraft:" + key, value);
+            // `consumable: false` is how an Oraxen item disables the
+            // component. Merely omitting it from a mapping would leave a
+            // vanilla base item's consumable component active on Bedrock.
+            if (value == null && key.equals("consumable")
+                    && entry.getValue() instanceof Boolean enabled
+                    && !enabled) {
+                putRemoval(output, key);
+            } else if (value != null && !value.isJsonNull()) {
+                putComponent(output, key, value);
+            }
         }
-        if (!output.has("minecraft:max_damage")) {
+        if (!output.has("minecraft:max_damage")
+                && !output.has("!minecraft:max_damage")) {
             Integer durability = Maps.integer(
                     Maps.section(item.mechanics(), "durability"), "value");
             if (durability != null && durability > 0)
@@ -70,6 +97,16 @@ final class ItemComponentConverter {
         }
     }
 
+    private void putComponent(JsonObject output, String key, JsonElement value) {
+        output.remove("!minecraft:" + key);
+        output.add("minecraft:" + key, value);
+    }
+
+    private void putRemoval(JsonObject output, String key) {
+        output.remove("minecraft:" + key);
+        output.add("!minecraft:" + key, new JsonObject());
+    }
+
     private JsonElement normalize(String component, JsonElement value) {
         if (component.equals("consumable") && value.isJsonPrimitive()
                 && value.getAsJsonPrimitive().isBoolean())
@@ -77,24 +114,7 @@ final class ItemComponentConverter {
         if (!value.isJsonObject()) return value;
         JsonObject object = value.getAsJsonObject();
         if (component.equals("equippable")) {
-            if (!object.has("allowed_entities") && object.has("allowed_entity_types"))
-                object.add("allowed_entities", object.remove("allowed_entity_types"));
-            JsonElement allowed = object.get("allowed_entities");
-            if (allowed != null && allowed.isJsonArray()) {
-                for (int index = 0; index < allowed.getAsJsonArray().size(); index++) {
-                    JsonElement entity = allowed.getAsJsonArray().get(index);
-                    if (entity.isJsonPrimitive() && entity.getAsJsonPrimitive().isString())
-                        allowed.getAsJsonArray().set(index,
-                                new com.google.gson.JsonPrimitive(identifier(entity.getAsString())));
-                }
-            } else if (allowed != null && allowed.isJsonPrimitive()
-                    && allowed.getAsJsonPrimitive().isString()) {
-                object.addProperty("allowed_entities", identifier(allowed.getAsString()));
-            }
-            if (object.has("equip_sound")
-                    && object.get("equip_sound").isJsonPrimitive())
-                object.addProperty("equip_sound",
-                        identifier(object.get("equip_sound").getAsString()));
+            normalizeEquippable(object);
         } else if (component.equals("consumable")) {
             normalizeConsumable(object);
         } else if (component.equals("tool")) {
@@ -107,6 +127,31 @@ final class ItemComponentConverter {
         return object;
     }
 
+    private void normalizeEquippable(JsonObject object) {
+        JsonElement canonicalAllowed = object.get("allowed_entities");
+        JsonElement oraxenAllowed = object.remove("allowed_entity_types");
+        if (canonicalAllowed != null || oraxenAllowed != null) {
+            Set<String> holders = new java.util.LinkedHashSet<>();
+            collectHolderValues(canonicalAllowed, false, holders);
+            collectHolderValues(oraxenAllowed, false, holders);
+            boolean collection = canonicalAllowed != null
+                    && canonicalAllowed.isJsonArray()
+                    || oraxenAllowed != null && oraxenAllowed.isJsonArray();
+            writeHolderValues(
+                    object, "allowed_entities", holders, !collection);
+        }
+        if (object.has("slot") && object.get("slot").isJsonPrimitive()
+                && object.getAsJsonPrimitive("slot").isString())
+            object.addProperty("slot", object.get("slot").getAsString()
+                    .trim().toLowerCase(Locale.ROOT));
+        if (object.has("equip_sound")
+                && object.get("equip_sound").isJsonPrimitive()) {
+            String sound = identifier(object.get("equip_sound").getAsString());
+            if (sound == null) object.remove("equip_sound");
+            else object.addProperty("equip_sound", sound);
+        }
+    }
+
     private void normalizeConsumable(JsonObject consumable) {
         if (consumable.has("animation")
                 && consumable.get("animation").isJsonPrimitive())
@@ -114,9 +159,11 @@ final class ItemComponentConverter {
                     consumable.get("animation").getAsString()
                             .toLowerCase(Locale.ROOT));
         if (consumable.has("sound")
-                && consumable.get("sound").isJsonPrimitive())
-            consumable.addProperty("sound",
-                    identifier(consumable.get("sound").getAsString()));
+                && consumable.get("sound").isJsonPrimitive()) {
+            String sound = identifier(consumable.get("sound").getAsString());
+            if (sound == null) consumable.remove("sound");
+            else consumable.addProperty("sound", sound);
+        }
         JsonElement effectsValue = consumable.get("on_consume_effects");
         if (effectsValue == null || !effectsValue.isJsonArray()) return;
         for (JsonElement value : effectsValue.getAsJsonArray()) {
@@ -125,9 +172,9 @@ final class ItemComponentConverter {
             String rawType = effect.has("type")
                     && effect.get("type").isJsonPrimitive()
                     ? effect.get("type").getAsString() : "";
-            String type = rawType.toLowerCase(Locale.ROOT);
-            if (!type.isBlank() && !type.contains(":"))
-                effect.addProperty("type", "minecraft:" + type);
+            String type = identifier(rawType);
+            if (type != null) effect.addProperty("type", type);
+            else continue;
             String shortType = type.contains(":")
                     ? type.substring(type.indexOf(':') + 1) : type;
             if (shortType.equals("apply_effects")
@@ -139,19 +186,23 @@ final class ItemComponentConverter {
                 normalizeHolderField(effect, "effects");
             else if (shortType.equals("play_sound")
                     && effect.has("sound")
-                    && effect.get("sound").isJsonPrimitive())
-                effect.addProperty("sound",
-                        identifier(effect.get("sound").getAsString()));
+                    && effect.get("sound").isJsonPrimitive()) {
+                String sound = identifier(effect.get("sound").getAsString());
+                if (sound == null) effect.remove("sound");
+                else effect.addProperty("sound", sound);
+            }
         }
     }
 
     private JsonArray normalizeEffectMap(JsonObject effects) {
         JsonArray result = new JsonArray();
         for (Map.Entry<String, JsonElement> entry : effects.entrySet()) {
+            String id = identifier(entry.getKey());
+            if (id == null) continue;
             JsonObject normalized = entry.getValue().isJsonObject()
                     ? entry.getValue().getAsJsonObject().deepCopy()
                     : new JsonObject();
-            normalized.addProperty("id", identifier(entry.getKey()));
+            normalized.addProperty("id", id);
             if (normalized.has("duration")
                     && normalized.get("duration").isJsonPrimitive()
                     && normalized.get("duration").getAsJsonPrimitive().isNumber())
@@ -173,7 +224,11 @@ final class ItemComponentConverter {
                 || !cooldown.get("cooldown_group").isJsonPrimitive()) return;
         String group = cooldown.get("cooldown_group").getAsString().trim();
         if (group.isEmpty()) cooldown.remove("cooldown_group");
-        else cooldown.addProperty("cooldown_group", identifier(group));
+        else {
+            String id = identifier(group);
+            if (id == null) cooldown.remove("cooldown_group");
+            else cooldown.addProperty("cooldown_group", id);
+        }
     }
 
     private void normalizeHolderField(JsonObject object, String field) {
@@ -181,14 +236,26 @@ final class ItemComponentConverter {
         if (value == null) return;
         Set<String> holders = new java.util.LinkedHashSet<>();
         collectHolderValues(value, false, holders);
+        writeHolderValues(object, field, holders);
+    }
+
+    private void writeHolderValues(
+            JsonObject object, String field, Set<String> holders) {
+        writeHolderValues(object, field, holders, true);
+    }
+
+    private void writeHolderValues(
+            JsonObject object, String field, Set<String> holders,
+            boolean collapseSingle) {
+        object.remove(field);
         if (holders.isEmpty()) return;
-        if (holders.size() == 1)
+        if (collapseSingle && holders.size() == 1) {
             object.addProperty(field, holders.iterator().next());
-        else {
-            JsonArray values = new JsonArray();
-            holders.forEach(values::add);
-            object.add(field, values);
+            return;
         }
+        JsonArray values = new JsonArray();
+        holders.forEach(values::add);
+        object.add(field, values);
     }
 
     private void normalizeToolRules(JsonObject tool) {
@@ -202,18 +269,12 @@ final class ItemComponentConverter {
             collectHolderValues(rule.get("materials"), false, blocks);
             collectHolderValues(rule.get("tag"), true, blocks);
             collectHolderValues(rule.get("tags"), true, blocks);
+            rule.remove("blocks");
             rule.remove("material");
             rule.remove("materials");
             rule.remove("tag");
             rule.remove("tags");
-            if (blocks.isEmpty()) continue;
-            if (blocks.size() == 1)
-                rule.addProperty("blocks", blocks.iterator().next());
-            else {
-                JsonArray values = new JsonArray();
-                blocks.forEach(values::add);
-                rule.add("blocks", values);
-            }
+            writeHolderValues(rule, "blocks", blocks);
         }
     }
 
@@ -233,11 +294,15 @@ final class ItemComponentConverter {
         boolean tagged = tag || raw.startsWith("#");
         String clean = raw.startsWith("#") ? raw.substring(1) : raw;
         String normalized = identifier(clean);
+        if (normalized == null) return;
         output.add(tagged ? "#" + normalized : normalized);
     }
 
     private String identifier(String value) {
-        String normalized = value.toLowerCase(Locale.ROOT).replace('\\', '/');
+        if (value == null) return null;
+        String normalized = value.trim().toLowerCase(Locale.ROOT)
+                .replace('\\', '/');
+        if (normalized.isEmpty()) return null;
         return normalized.contains(":") ? normalized : "minecraft:" + normalized;
     }
 }

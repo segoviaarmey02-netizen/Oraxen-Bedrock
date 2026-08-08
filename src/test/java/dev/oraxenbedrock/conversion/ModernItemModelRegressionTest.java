@@ -143,6 +143,8 @@ class ModernItemModelRegressionTest {
             assertEquals("bundle_fullness",
                     predicate.get("property").getAsString());
             assertEquals(0.5, predicate.get("threshold").getAsDouble());
+            assertFalse(predicate.has("normalize"),
+                    "Bundle fullness cannot be normalized by Geyser");
             assertTrue(result.warnings().isEmpty());
         }
     }
@@ -999,6 +1001,182 @@ class ModernItemModelRegressionTest {
                     "/textures/items/table.png")));
             assertTrue(Files.isRegularFile(pack.getPath(
                     "/textures/items/arrow_next_icon.png")));
+        }
+    }
+
+    @Test
+    void defaultsCustomModelDataPredicateIndicesAndNormalizesMatchIds()
+            throws Exception {
+        Path pack = resourcePack(Map.of(
+                "flag", """
+                        {"model":{"type":"minecraft:condition",
+                          "property":"minecraft:custom_model_data",
+                          "on_false":{"type":"minecraft:model",
+                            "model":"oraxen:item/plain"},
+                          "on_true":{"type":"minecraft:model",
+                            "model":"oraxen:item/flagged"}}}
+                        """,
+                "string", """
+                        {"model":{"type":"minecraft:select",
+                          "property":"minecraft:custom_model_data",
+                          "fallback":{"type":"minecraft:model",
+                            "model":"oraxen:item/plain"},
+                          "cases":[{"when":"VariantA",
+                            "model":{"type":"minecraft:model",
+                              "model":"oraxen:item/string"}}]}}
+                        """,
+                "float", """
+                        {"model":{"type":"minecraft:range_dispatch",
+                          "property":"minecraft:custom_model_data",
+                          "fallback":{"type":"minecraft:model",
+                            "model":"oraxen:item/plain"},
+                          "entries":[{"threshold":2,
+                            "model":{"type":"minecraft:model",
+                              "model":"oraxen:item/float"}}]}}
+                        """,
+                "dimension", """
+                        {"model":{"type":"minecraft:select",
+                          "property":"minecraft:context_dimension",
+                          "fallback":{"type":"minecraft:model",
+                            "model":"oraxen:item/plain"},
+                          "cases":[{"when":"THE_END",
+                            "model":{"type":"minecraft:model",
+                              "model":"oraxen:item/end"}}]}}
+                        """));
+
+        try (PackSource source = PackSource.open(pack)) {
+            JavaItemModelResolver resolver =
+                    new JavaItemModelResolver(source, "oraxen");
+            for (String definition : List.of("flag", "string", "float")) {
+                JavaItemModelResolver.Result result =
+                        resolver.resolve("oraxen:" + definition);
+                assertEquals(1, result.variants().size());
+                JsonObject predicate = result.variants().get(0)
+                        .predicates().get(0);
+                assertEquals("custom_model_data",
+                        predicate.get("property").getAsString());
+                assertEquals(0, predicate.get("index").getAsInt(),
+                        "Java defaults a missing custom model data index to zero, "
+                                + "while Geyser requires it explicitly");
+            }
+
+            JsonObject dimension = resolver.resolve("oraxen:dimension")
+                    .variants().get(0).predicates().get(0);
+            assertEquals("minecraft:the_end",
+                    dimension.get("value").getAsString());
+            JsonObject string = resolver.resolve("oraxen:string")
+                    .variants().get(0).predicates().get(0);
+            assertEquals("VariantA", string.get("value").getAsString(),
+                    "Custom model data strings are case-sensitive and must not "
+                            + "be normalized like resource locations");
+        }
+    }
+
+    @Test
+    void fallsBackForUnrepresentableConditionsAndInvalidPredicateValues()
+            throws Exception {
+        Path pack = resourcePack(Map.of(
+                "component", """
+                        {"model":{"type":"minecraft:condition",
+                          "property":"minecraft:has_component",
+                          "component":"minecraft:food",
+                          "ignore_default":true,
+                          "on_false":{"type":"minecraft:model",
+                            "model":"oraxen:item/normal"},
+                          "on_true":{"type":"minecraft:model",
+                            "model":"oraxen:item/wrong"}}}
+                        """,
+                "charge", """
+                        {"model":{"type":"minecraft:select",
+                          "property":"minecraft:charge_type",
+                          "fallback":{"type":"minecraft:model",
+                            "model":"oraxen:item/uncharged"},
+                          "cases":[
+                            {"when":"none","model":{"type":"minecraft:model",
+                              "model":"oraxen:item/invalid_none"}},
+                            {"when":"ROCKET","model":{"type":"minecraft:model",
+                              "model":"oraxen:item/rocket"}}
+                          ]}}
+                        """,
+                "range", """
+                        {"model":{"type":"minecraft:range_dispatch",
+                          "property":"minecraft:count",
+                          "fallback":{"type":"minecraft:model",
+                            "model":"oraxen:item/one"},
+                          "entries":[
+                            {"threshold":"not-a-number",
+                             "model":{"type":"minecraft:model",
+                               "model":"oraxen:item/invalid"}},
+                            {"threshold":2,
+                             "model":{"type":"minecraft:model",
+                               "model":"oraxen:item/two"}}
+                          ]}}
+                        """));
+
+        try (PackSource source = PackSource.open(pack)) {
+            JavaItemModelResolver resolver =
+                    new JavaItemModelResolver(source, "oraxen");
+            JavaItemModelResolver.Result component =
+                    resolver.resolve("oraxen:component");
+            assertEquals("oraxen:item/normal", component.model());
+            assertTrue(component.variants().isEmpty());
+            assertTrue(component.warnings().stream()
+                    .anyMatch(warning -> warning.contains("ignore_default=true")));
+
+            JavaItemModelResolver.Result charge =
+                    resolver.resolve("oraxen:charge");
+            assertEquals(List.of("oraxen:item/rocket"), charge.variants()
+                    .stream().map(JavaItemModelResolver.Variant::model).toList());
+            assertEquals("rocket", charge.variants().get(0).predicates()
+                    .get(0).get("value").getAsString());
+            assertTrue(charge.warnings().stream()
+                    .anyMatch(warning -> warning.contains("'none'")));
+
+            JavaItemModelResolver.Result range =
+                    resolver.resolve("oraxen:range");
+            assertEquals(List.of("oraxen:item/two"), range.variants()
+                    .stream().map(JavaItemModelResolver.Variant::model).toList());
+            assertTrue(range.warnings().stream()
+                    .anyMatch(warning -> warning.contains("non-numeric threshold")));
+        }
+    }
+
+    @Test
+    void preservesJavaRangeNormalizationDefaults() throws Exception {
+        Path pack = resourcePack(Map.of(
+                "count", """
+                        {"model":{"type":"minecraft:range_dispatch",
+                          "property":"minecraft:count",
+                          "fallback":{"type":"minecraft:model",
+                            "model":"oraxen:item/one"},
+                          "entries":[{"threshold":0.5,
+                            "model":{"type":"minecraft:model",
+                              "model":"oraxen:item/half_stack"}}]}}
+                        """,
+                "damage", """
+                        {"model":{"type":"minecraft:range_dispatch",
+                          "property":"minecraft:damage",
+                          "normalize":false,
+                          "fallback":{"type":"minecraft:model",
+                            "model":"oraxen:item/intact"},
+                          "entries":[{"threshold":10,
+                            "model":{"type":"minecraft:model",
+                              "model":"oraxen:item/damaged"}}]}}
+                        """));
+
+        try (PackSource source = PackSource.open(pack)) {
+            JavaItemModelResolver resolver =
+                    new JavaItemModelResolver(source, "oraxen");
+            JsonObject count = resolver.resolve("oraxen:count")
+                    .variants().get(0).predicates().get(0);
+            assertTrue(count.get("normalize").getAsBoolean(),
+                    "Java count dispatch defaults normalize to true, but "
+                            + "Geyser defaults it to false");
+
+            JsonObject damage = resolver.resolve("oraxen:damage")
+                    .variants().get(0).predicates().get(0);
+            assertFalse(damage.get("normalize").getAsBoolean(),
+                    "An explicit Java normalize=false must be retained");
         }
     }
 

@@ -24,9 +24,7 @@ class GeyserDisplayEntityMappingsWriterTest {
     @Test
     void writesOnlyModernIdentifiersUsingCurrentExtensionSchema()
             throws Exception {
-        Path geyser = temp.resolve("Geyser-Spigot");
-        Files.createDirectories(geyser.resolve(
-                "extensions/geyserdisplayentity"));
+        Path geyser = installedExtension("current-schema");
 
         OraxenItem modern = item("Fancy Chair", "PAPER", null, true);
         OraxenItem legacyConfigured = item(
@@ -84,17 +82,32 @@ class GeyserDisplayEntityMappingsWriterTest {
     }
 
     @Test
+    void staleDataFolderAndCorruptNamedJarDoNotCountAsInstalled()
+            throws Exception {
+        Path geyser = temp.resolve("stale-extension");
+        Path target = geyser.resolve(
+                "extensions/geyserdisplayentity/Mappings/oraxen.yml");
+        Files.createDirectories(target.getParent());
+        Files.writeString(target, "existing: true\n");
+        Files.writeString(geyser.resolve(
+                "extensions/GeyserDisplayEntity.jar"), "not a jar");
+
+        GeyserDisplayEntityMappingsWriter.Result result =
+                GeyserDisplayEntityMappingsWriter.write(
+                        geyser, List.of(item("chair", "PAPER", null, true)));
+
+        assertEquals(GeyserDisplayEntityMappingsWriter.Status.EXTENSION_MISSING,
+                result.status());
+        assertEquals(0, result.mappings());
+        assertEquals("existing: true\n", Files.readString(target));
+    }
+
+    @Test
     void detectsRenamedExtensionJarByDescriptor() throws Exception {
         Path geyser = temp.resolve("renamed-jar");
         Path extensions = geyser.resolve("extensions");
         Files.createDirectories(extensions);
-        try (ZipOutputStream output = new ZipOutputStream(
-                Files.newOutputStream(extensions.resolve("display-support.jar")))) {
-            output.putNextEntry(new ZipEntry("extension.yml"));
-            output.write("name: Display Support\nid: geyserdisplayentity\n"
-                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            output.closeEntry();
-        }
+        writeExtensionJar(extensions.resolve("display-support.jar"));
 
         GeyserDisplayEntityMappingsWriter.Result result =
                 GeyserDisplayEntityMappingsWriter.write(
@@ -127,6 +140,42 @@ class GeyserDisplayEntityMappingsWriterTest {
         assertEquals("minecraft:diamond", mapping.get("type"));
         assertEquals("oraxen:chair_model", mapping.get("item-identifier"));
         assertFalse(mapping.containsKey("model-data"));
+    }
+
+    @Test
+    void writesMappingsForEveryGeneratedFurnitureStateIdentifier()
+            throws Exception {
+        Path geyser = installedExtension("generated-states");
+        OraxenItem furniture = item("chair", "PAPER", null,
+                furniture("item", "chair_helper"));
+        OraxenItem helper = item("chair_helper", "DIAMOND", null, Map.of());
+
+        GeyserDisplayEntityMappingsWriter.Result result =
+                GeyserDisplayEntityMappingsWriter.write(
+                        geyser, "oraxen", List.of(furniture, helper), List.of(
+                                "oraxen:chair_helper",
+                                "oraxen:chair_state_0123456789ab",
+                                "oraxen:chair_model_active_0123456789",
+                                "oraxen:chair_model_active_0123456789_state_abcdef012345",
+                                "oraxen:chair_model_unrelated",
+                                "oraxen:chair_state_not_a_hash",
+                                "other:chair_state_wrong_namespace"));
+
+        assertEquals(4, result.mappings());
+        assertTrue(result.diagnostics().isEmpty());
+        Map<?, ?> mappings = section(load(result.file()), "mappings");
+        assertEquals(4, mappings.size());
+        assertEquals(java.util.Set.of(
+                        "oraxen:chair_helper",
+                        "oraxen:chair_state_0123456789ab",
+                        "oraxen:chair_model_active_0123456789",
+                        "oraxen:chair_model_active_0123456789_state_abcdef012345"),
+                mappings.values().stream()
+                        .map(value -> ((Map<?, ?>) value).get("item-identifier"))
+                        .collect(java.util.stream.Collectors.toSet()));
+        assertTrue(mappings.values().stream()
+                .map(value -> ((Map<?, ?>) value).get("type"))
+                .allMatch("minecraft:diamond"::equals));
     }
 
     @Test
@@ -210,7 +259,7 @@ class GeyserDisplayEntityMappingsWriterTest {
 
     @Test
     void collisionFailsBeforeReplacingExistingMapping() throws Exception {
-        Path geyser = temp.resolve("collision");
+        Path geyser = installedExtension("collision");
         Path target = geyser.resolve(
                 "extensions/geyserdisplayentity/Mappings/oraxen.yml");
         Files.createDirectories(target.getParent());
@@ -227,9 +276,20 @@ class GeyserDisplayEntityMappingsWriterTest {
 
     private Path installedExtension(String name) throws Exception {
         Path geyser = temp.resolve(name);
-        Files.createDirectories(geyser.resolve(
-                "extensions/geyserdisplayentity"));
+        Path extensions = geyser.resolve("extensions");
+        Files.createDirectories(extensions);
+        writeExtensionJar(extensions.resolve("GeyserDisplayEntity.jar"));
         return geyser;
+    }
+
+    private static void writeExtensionJar(Path target) throws Exception {
+        try (ZipOutputStream output = new ZipOutputStream(
+                Files.newOutputStream(target))) {
+            output.putNextEntry(new ZipEntry("extension.yml"));
+            output.write("name: Display Support\nid: geyserdisplayentity\n"
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            output.closeEntry();
+        }
     }
 
     private static void writeArchive(Path target, Map<String, String> entries)

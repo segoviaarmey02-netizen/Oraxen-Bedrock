@@ -102,8 +102,9 @@ public final class PackConverter {
                 String resolvedModel = configuredModel;
                 String itemModelReference = item.itemModel() == null
                         ? ORAXEN_NAMESPACE + ":" + item.id() : item.itemModel();
-                JavaItemModelResolver.Result modern =
-                        itemModelResolver.resolve(itemModelReference);
+                JavaItemModelResolver.Result modern = resolveItemModelSafely(
+                        itemModelResolver, itemModelReference,
+                        "item definition for '" + item.id() + "'", warnings);
                 boolean modernDefinitionFound = modern.definitionFound();
                 boolean ambiguousMaterialAppearance = false;
                 String mappingModelReference = normalizeModel(
@@ -130,7 +131,11 @@ public final class PackConverter {
                 if (!modernDefinitionFound) {
                     String materialModel = javaIdentifier(item.material());
                     JavaItemModelResolver.Result materialDefinition =
-                            itemModelResolver.resolve(materialModel);
+                            resolveItemModelSafely(
+                                    itemModelResolver, materialModel,
+                                    "material item definition for '"
+                                            + item.id() + "'",
+                                    warnings);
                     Map<String, List<JavaItemModelResolver.Variant>>
                             selectedGroups = new LinkedHashMap<>();
                     materialDefinition.variants().stream()
@@ -194,8 +199,11 @@ public final class PackConverter {
                         modernDefinitionFound
                                 ? new LegacyJavaItemModelResolver.Result(
                                 resolvedModel, false, List.of(), List.of())
-                                : legacyItemModelResolver.resolve(
-                                resolvedModel, item.customModelData());
+                                : resolveLegacyItemModelSafely(
+                                        legacyItemModelResolver, resolvedModel,
+                                        item.customModelData(),
+                                        "legacy model for '" + item.id() + "'",
+                                        warnings);
                 warnings.addAll(legacyModel.warnings().stream()
                         .map(w -> item.id() + ": " + w).toList());
                 if (legacyModel.modelFound()) resolvedModel = legacyModel.model();
@@ -209,7 +217,14 @@ public final class PackConverter {
                 if (modern.definitionFound() && modern.model() != null
                         && baseDefinitionPredicates.isEmpty())
                     resolvedModel = modern.model();
-                Path texture = findItemTexture(source, item, resolvedModel, ORAXEN_NAMESPACE);
+                Path texture = null;
+                try {
+                    texture = findItemTexture(
+                            source, item, resolvedModel, ORAXEN_NAMESPACE);
+                } catch (IOException | RuntimeException exception) {
+                    warnings.add("Could not resolve source texture for item '"
+                            + item.id() + "': " + exception.getMessage());
+                }
                 if (texture != null && !readableImage(texture)) {
                     warnings.add("Source texture for item '" + item.id()
                             + "' is not a readable PNG: " + texture);
@@ -600,9 +615,10 @@ public final class PackConverter {
             Path packTarget = config.geyserDirectory().resolve("packs/OraxenBedrock.mcpack");
             Path itemTarget = config.geyserDirectory().resolve("custom_mappings/oraxen-items.json");
             Path blockTarget = config.geyserDirectory().resolve("custom_mappings/oraxen-blocks.json");
-            atomicInstall(localPack, packTarget);
-            atomicInstall(generated.resolve("oraxen-items.json"), itemTarget);
-            atomicInstall(generated.resolve("oraxen-blocks.json"), blockTarget);
+            installOutputsTransactionally(config.geyserDirectory(),
+                    new InstallFile(localPack, packTarget),
+                    new InstallFile(generated.resolve("oraxen-items.json"), itemTarget),
+                    new InstallFile(generated.resolve("oraxen-blocks.json"), blockTarget));
 
             GeyserDisplayEntityMappingsWriter.Result displayEntityIntegration = null;
             List<String> displayFurniture = displayEntityFurniture(items);
@@ -1687,6 +1703,38 @@ public final class PackConverter {
         return List.copyOf(textures);
     }
 
+    private JavaItemModelResolver.Result resolveItemModelSafely(
+            JavaItemModelResolver resolver, String reference, String context,
+            List<String> warnings) {
+        try {
+            return resolver.resolve(reference);
+        } catch (IOException | RuntimeException exception) {
+            warnings.add("Could not resolve " + context + " ('" + reference
+                    + "'): " + resolutionFailure(exception));
+            return new JavaItemModelResolver.Result(
+                    null, false, List.of(), List.of(), List.of());
+        }
+    }
+
+    private LegacyJavaItemModelResolver.Result resolveLegacyItemModelSafely(
+            LegacyJavaItemModelResolver resolver, String reference,
+            Integer customModelData, String context, List<String> warnings) {
+        try {
+            return resolver.resolve(reference, customModelData);
+        } catch (IOException | RuntimeException exception) {
+            warnings.add("Could not resolve " + context + " ('" + reference
+                    + "'): " + resolutionFailure(exception));
+            return new LegacyJavaItemModelResolver.Result(
+                    null, false, List.of(), List.of());
+        }
+    }
+
+    private String resolutionFailure(Exception exception) {
+        String message = exception.getMessage();
+        return message == null || message.isBlank()
+                ? exception.getClass().getSimpleName() : message;
+    }
+
     private PackModelCounts convertPackModelVariants(
             OraxenItem item, OraxenItem mappingItem, String safeId,
             JsonObject templateDefinition,
@@ -1703,8 +1751,11 @@ public final class PackConverter {
             String key = entry.getKey();
             String javaItemModel = ORAXEN_NAMESPACE + ":"
                     + item.id() + "/" + key;
-            JavaItemModelResolver.Result resolved =
-                    itemModelResolver.resolve(javaItemModel);
+            JavaItemModelResolver.Result resolved = resolveItemModelSafely(
+                    itemModelResolver, javaItemModel,
+                    "Pack.models." + key + " definition for item '"
+                            + item.id() + "'",
+                    warnings);
             warnings.addAll(resolved.warnings().stream()
                     .map(w -> item.id() + " Pack.models." + key + ": " + w)
                     .toList());
@@ -2274,8 +2325,10 @@ public final class PackConverter {
                                       List<String> warnings) throws IOException {
         long expectedItems = items.stream().filter(this::expectsCustomMapping).count();
         JsonObject mappedItems = itemMappings.getAsJsonObject("items");
+        boolean usableItemMappings =
+                PackValidator.hasUsableItemMappings(mappedItems);
         if (config.convertItems() && expectedItems > 0
-                && (mappedItems == null || mappedItems.isEmpty())) {
+                && !usableItemMappings) {
             String diagnostic = warnings.stream()
                     .filter(warning -> warning.contains("Skipped custom mapping"))
                     .findFirst().orElse(warnings.isEmpty() ? "" : warnings.get(0));
@@ -2285,7 +2338,7 @@ public final class PackConverter {
         }
 
         JsonObject mappedBlocks = blockMappings.getAsJsonObject("blocks");
-        boolean mappings = mappedItems != null && !mappedItems.isEmpty()
+        boolean mappings = usableItemMappings
                 || mappedBlocks != null && !mappedBlocks.isEmpty();
         try (Stream<Path> paths = Files.walk(bedrock)) {
             boolean resources = paths.filter(Files::isRegularFile)
@@ -2340,19 +2393,137 @@ public final class PackConverter {
                         || segment.equalsIgnoreCase("__MACOSX"));
     }
 
-    private void atomicInstall(Path source, Path destination) throws IOException {
-        Files.createDirectories(destination.getParent());
-        Path temporary = destination.resolveSibling(destination.getFileName() + ".tmp");
+    private void installOutputsTransactionally(
+            Path targetRoot, InstallFile... installs) throws IOException {
+        installOutputsTransactionally(
+                targetRoot, List.of(installs), PackConverter::moveReplacing);
+    }
+
+    void installOutputsTransactionally(Path targetRoot, List<InstallFile> installs,
+                                       InstallMove move) throws IOException {
+        Objects.requireNonNull(targetRoot, "targetRoot");
+        Objects.requireNonNull(installs, "installs");
+        Objects.requireNonNull(move, "move");
+        if (installs.isEmpty()) return;
+
+        Path root = targetRoot.toAbsolutePath().normalize();
+        Files.createDirectories(root);
+        Path transaction = Files.createTempDirectory(
+                root, ".oraxenbedrock-install-");
+        Path stagedDirectory = transaction.resolve("new");
+        Path backupDirectory = transaction.resolve("backup");
+        int count = installs.size();
+        Path[] destinations = new Path[count];
+        Path[] staged = new Path[count];
+        Path[] backups = new Path[count];
+        boolean[] existed = new boolean[count];
+        boolean[] backedUp = new boolean[count];
+        boolean[] commitAttempted = new boolean[count];
+        Set<Path> uniqueDestinations = new HashSet<>();
+
         try {
-            Files.copy(source, temporary, StandardCopyOption.REPLACE_EXISTING);
-            try {
-                Files.move(temporary, destination, StandardCopyOption.REPLACE_EXISTING,
-                        StandardCopyOption.ATOMIC_MOVE);
-            } catch (AtomicMoveNotSupportedException ex) {
-                Files.move(temporary, destination, StandardCopyOption.REPLACE_EXISTING);
+            Files.createDirectories(stagedDirectory);
+            Files.createDirectories(backupDirectory);
+            FileStore transactionStore = Files.getFileStore(transaction);
+            for (int index = 0; index < count; index++) {
+                InstallFile install = Objects.requireNonNull(
+                        installs.get(index), "install");
+                Path source = install.source().toAbsolutePath().normalize();
+                Path destination = install.destination().toAbsolutePath().normalize();
+                if (!Files.isRegularFile(source))
+                    throw new IOException("Generated output is missing: " + source);
+                if (!destination.startsWith(root) || destination.equals(root))
+                    throw new IOException("Install target is outside Geyser directory: "
+                            + destination);
+                if (!uniqueDestinations.add(destination))
+                    throw new IOException("Duplicate install target: " + destination);
+                Path parent = destination.getParent();
+                if (parent == null)
+                    throw new IOException("Install target has no parent: " + destination);
+                Files.createDirectories(parent);
+                if (!Files.getFileStore(parent).equals(transactionStore))
+                    throw new IOException("Install target is on a different file system: "
+                            + destination);
+                existed[index] = Files.exists(
+                        destination, LinkOption.NOFOLLOW_LINKS);
+                if (existed[index] && !Files.isRegularFile(
+                        destination, LinkOption.NOFOLLOW_LINKS))
+                    throw new IOException("Install target is not a regular file: "
+                            + destination);
+                destinations[index] = destination;
+                staged[index] = stagedDirectory.resolve(Integer.toString(index));
+                backups[index] = backupDirectory.resolve(Integer.toString(index));
+                Files.copy(source, staged[index]);
             }
-        } finally {
-            Files.deleteIfExists(temporary);
+
+            for (int index = 0; index < count; index++) {
+                if (!existed[index]) continue;
+                move.move(destinations[index], backups[index]);
+                backedUp[index] = true;
+            }
+            for (int index = 0; index < count; index++) {
+                commitAttempted[index] = true;
+                move.move(staged[index], destinations[index]);
+            }
+        } catch (IOException | RuntimeException exception) {
+            IOException failure = exception instanceof IOException io
+                    ? io : new IOException("Could not install generated outputs", exception);
+            boolean rollbackComplete = rollbackInstall(destinations, backups,
+                    existed, backedUp, commitAttempted, move, failure);
+            if (rollbackComplete) {
+                try {
+                    deleteTreeStrict(transaction);
+                } catch (IOException cleanupException) {
+                    failure.addSuppressed(cleanupException);
+                }
+            } else {
+                failure.addSuppressed(new IOException(
+                        "Install rollback was incomplete; recovery files remain in "
+                                + transaction));
+            }
+            throw failure;
+        }
+        deleteTreeStrict(transaction);
+    }
+
+    private boolean rollbackInstall(
+            Path[] destinations, Path[] backups, boolean[] existed,
+            boolean[] backedUp, boolean[] commitAttempted, InstallMove move,
+            IOException failure) {
+        boolean complete = true;
+        for (int index = destinations.length - 1; index >= 0; index--) {
+            Path destination = destinations[index];
+            if (destination == null) continue;
+            try {
+                boolean backupExists = backups[index] != null && Files.exists(
+                        backups[index], LinkOption.NOFOLLOW_LINKS);
+                if (backedUp[index] || backupExists) {
+                    if (!backupExists)
+                        throw new IOException("Previous output backup is missing for "
+                                + destination);
+                    move.move(backups[index], destination);
+                } else if (!existed[index] && commitAttempted[index]) {
+                    if (Files.exists(destination, LinkOption.NOFOLLOW_LINKS)
+                            && !Files.isRegularFile(
+                            destination, LinkOption.NOFOLLOW_LINKS))
+                        throw new IOException("Cannot remove non-file rollback target: "
+                                + destination);
+                    Files.deleteIfExists(destination);
+                }
+            } catch (IOException | RuntimeException rollbackException) {
+                complete = false;
+                failure.addSuppressed(rollbackException);
+            }
+        }
+        return complete;
+    }
+
+    static void moveReplacing(Path source, Path destination) throws IOException {
+        try {
+            Files.move(source, destination, StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException exception) {
+            Files.move(source, destination, StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
@@ -2362,19 +2533,27 @@ public final class PackConverter {
     }
 
     private void deleteTree(Path root) {
-        if (!Files.exists(root)) return;
         try {
-            Files.walkFileTree(root, new SimpleFileVisitor<>() {
-                @Override public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                    Files.deleteIfExists(file);
-                    return FileVisitResult.CONTINUE;
-                }
-                @Override public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
-                    Files.deleteIfExists(dir);
-                    return FileVisitResult.CONTINUE;
-                }
-            });
+            deleteTreeStrict(root);
         } catch (IOException ignored) {}
+    }
+
+    private static void deleteTreeStrict(Path root) throws IOException {
+        if (!Files.exists(root, LinkOption.NOFOLLOW_LINKS)) return;
+        Files.walkFileTree(root, new SimpleFileVisitor<>() {
+            @Override public FileVisitResult visitFile(
+                    Path file, BasicFileAttributes attrs) throws IOException {
+                Files.deleteIfExists(file);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override public FileVisitResult postVisitDirectory(
+                    Path directory, IOException exception) throws IOException {
+                if (exception != null) throw exception;
+                Files.deleteIfExists(directory);
+                return FileVisitResult.CONTINUE;
+            }
+        });
     }
 
     private int countPngFiles(Path root) throws IOException {
@@ -2437,6 +2616,11 @@ public final class PackConverter {
 
     private record IconLayer(BufferedImage image, int width, int height) {}
     private record PackModelCounts(int mappings, int geometries, int equipment) {}
+    record InstallFile(Path source, Path destination) {}
+    @FunctionalInterface
+    interface InstallMove {
+        void move(Path source, Path destination) throws IOException;
+    }
     private record MultipartPart(BlockVariant variant,
                                  JavaModelConverter.ConvertedModel model,
                                  int textureWidth, int textureHeight) {}

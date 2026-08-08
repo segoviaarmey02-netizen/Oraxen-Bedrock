@@ -85,7 +85,7 @@ public final class GeyserDisplayEntityMappingsWriter {
         Path target = dataFolder.resolve("Mappings/oraxen.yml");
         boolean companionPackFound = hasCompanionPack(
                 geyserDirectory.resolve("packs"));
-        if (!Files.isDirectory(dataFolder) && !hasExtensionJar(extensions))
+        if (!hasExtensionJar(extensions))
             return new Result(Status.EXTENSION_MISSING, target, 0,
                     companionPackFound, List.of());
 
@@ -110,6 +110,7 @@ public final class GeyserDisplayEntityMappingsWriter {
                 item -> safeId(item.id()), String.CASE_INSENSITIVE_ORDER));
 
         Map<String, Object> mappings = new LinkedHashMap<>();
+        Set<String> furnitureIds = new HashSet<>();
         List<String> diagnostics = new ArrayList<>();
         for (OraxenItem item : furniture) {
             String id = safeId(item.id());
@@ -121,6 +122,10 @@ public final class GeyserDisplayEntityMappingsWriter {
                     : type.trim().toUpperCase(Locale.ROOT)
                     .replace('-', '_').replace(' ', '_');
             if (!normalizedType.equals("DISPLAY_ENTITY")) continue;
+
+            if (!furnitureIds.add(id))
+                throw new IOException("Oraxen furniture identifiers collide after "
+                        + "Bedrock sanitization: " + id);
 
             OraxenItem displayedItem = item;
             String helperId = Maps.string(furnitureMechanic, "item");
@@ -135,24 +140,29 @@ public final class GeyserDisplayEntityMappingsWriter {
                 }
             }
 
-            if (mappings.containsKey(id))
-                throw new IOException("Oraxen furniture identifiers collide after "
-                        + "Bedrock sanitization: " + id);
-
             String displayedId = safeId(displayedItem.id());
-            String bedrockIdentifier = namespace + ":" + displayedId;
-            if (available != null && !available.contains(bedrockIdentifier)) {
+            List<String> bedrockIdentifiers = furnitureBedrockIdentifiers(
+                    namespace, id, displayedId, available);
+            if (bedrockIdentifiers.isEmpty()) {
                 diagnostics.add("Skipped furniture '" + item.id()
-                        + "': its displayed Bedrock item '" + bedrockIdentifier
+                        + "': its displayed Bedrock item '" + namespace + ":"
+                        + displayedId
                         + "' was not generated");
                 continue;
             }
 
-            Map<String, Object> mapping = new LinkedHashMap<>();
-            mapping.put("type", javaIdentifier(displayedItem.material()));
-            mapping.put("item-identifier", extensionItemIdentifier(
-                    namespace, displayedId));
-            mappings.put(id, mapping);
+            int variant = 0;
+            for (String bedrockIdentifier : bedrockIdentifiers) {
+                String identifier = bedrockIdentifier.substring(
+                        bedrockIdentifier.indexOf(':') + 1);
+                String mappingKey = uniqueMappingKey(
+                        mappings, id, identifier, variant++);
+                Map<String, Object> mapping = new LinkedHashMap<>();
+                mapping.put("type", javaIdentifier(displayedItem.material()));
+                mapping.put("item-identifier", extensionItemIdentifier(
+                        namespace, identifier));
+                mappings.put(mappingKey, mapping);
+            }
         }
 
         Map<String, Object> document = new LinkedHashMap<>();
@@ -176,13 +186,46 @@ public final class GeyserDisplayEntityMappingsWriter {
             for (Path file : files.filter(Files::isRegularFile).sorted().toList()) {
                 String name = file.getFileName().toString();
                 if (!name.toLowerCase(Locale.ROOT).endsWith(".jar")) continue;
-                String compact = name.toLowerCase(Locale.ROOT)
-                        .replaceAll("[^a-z0-9]", "");
-                if (compact.contains(EXTENSION_ID) || hasExtensionDescriptor(file))
-                    return true;
+                if (hasExtensionDescriptor(file)) return true;
             }
         }
         return false;
+    }
+
+    private static List<String> furnitureBedrockIdentifiers(
+            String namespace, String furnitureId, String displayedId,
+            Set<String> available) {
+        String base = namespace + ":" + displayedId;
+        if (available == null) return List.of(base);
+        String prefix = namespace + ":";
+        // GeyserDisplayEntity compares modern mappings to the exact translated
+        // Bedrock identifier. PackConverter gives generated visual states these
+        // deterministic names, so every present state needs its own entry.
+        Pattern generatedState = Pattern.compile(Pattern.quote(furnitureId)
+                + "(?:_state_[0-9a-f]{12}|_model_.+_[0-9a-f]{10}"
+                + "(?:_state_[0-9a-f]{12})?)");
+        return available.stream()
+                .filter(identifier -> identifier.startsWith(prefix))
+                .filter(identifier -> {
+                    String id = identifier.substring(prefix.length());
+                    return identifier.equals(base)
+                            || generatedState.matcher(id).matches();
+                })
+                .sorted(Comparator
+                        .comparing((String identifier) -> !identifier.equals(base))
+                        .thenComparing(Comparator.naturalOrder()))
+                .toList();
+    }
+
+    private static String uniqueMappingKey(
+            Map<String, Object> mappings, String furnitureId,
+            String bedrockId, int variant) {
+        String preferred = variant == 0
+                ? furnitureId : furnitureId + "__" + bedrockId;
+        String result = preferred;
+        for (int suffix = 2; mappings.containsKey(result); suffix++)
+            result = preferred + "__" + suffix;
+        return result;
     }
 
     private static boolean hasCompanionPack(Path packs) throws IOException {

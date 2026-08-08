@@ -184,8 +184,13 @@ final class JavaItemModelResolver {
             case "condition" -> {
                 JsonObject predicate = conditionPredicate(object);
                 if (predicate == null) {
-                    warnings.add("Unsupported Java item condition '"
-                            + property(object) + "' uses its normal branch");
+                    if (hasIgnoredDefaultComponentCondition(object))
+                        warnings.add("Java has_component condition with "
+                                + "ignore_default=true cannot be represented by "
+                                + "Geyser and uses its normal branch");
+                    else
+                        warnings.add("Unsupported Java item condition '"
+                                + property(object) + "' uses its normal branch");
                     JsonElement normal = object.has("on_false")
                             ? object.get("on_false") : object.get("on_true");
                     collect(normal, predicates, baseline, compositeLayer,
@@ -222,11 +227,20 @@ final class JavaItemModelResolver {
                     if (!value.isJsonObject()) continue;
                     JsonObject entry = value.getAsJsonObject();
                     for (String when : strings(entry.get("when"))) {
+                        String matchValue = matchValue(
+                                predicateProperty, when);
+                        if (matchValue == null) {
+                            warnings.add("Unsupported Java item select value '"
+                                    + when + "' for property '"
+                                    + property(object) + "'");
+                            continue;
+                        }
                         JsonObject predicate = new JsonObject();
                         predicate.addProperty("type", "match");
                         predicate.addProperty("property", predicateProperty);
-                        predicate.addProperty("value", when);
-                        copyIndex(object, predicate);
+                        predicate.addProperty("value", matchValue);
+                        copyIndex(object, predicate,
+                                predicateProperty.equals("custom_model_data"));
                         collect(entry.get("model"), append(predicates, predicate),
                                 false, compositeLayer, output, warnings, depth + 1);
                     }
@@ -249,16 +263,22 @@ final class JavaItemModelResolver {
                     if (!value.isJsonObject()) continue;
                     JsonObject entry = value.getAsJsonObject();
                     if (!entry.has("threshold")
-                            || !entry.get("threshold").isJsonPrimitive()) continue;
+                            || !finiteNumber(entry.get("threshold"))) {
+                        warnings.add("Java item range entry for property '"
+                                + property(object)
+                                + "' has a non-numeric threshold and was skipped");
+                        continue;
+                    }
                     JsonObject predicate = new JsonObject();
                     predicate.addProperty("type", "range_dispatch");
                     predicate.addProperty("property", predicateProperty);
                     predicate.add("threshold", entry.get("threshold").deepCopy());
-                    if (object.has("normalize"))
-                        predicate.add("normalize", object.get("normalize").deepCopy());
-                    if (object.has("scale"))
+                    copyRangeNormalization(
+                            object, predicate, predicateProperty);
+                    if (object.has("scale") && finiteNumber(object.get("scale")))
                         predicate.add("scale", object.get("scale").deepCopy());
-                    copyIndex(object, predicate);
+                    copyIndex(object, predicate,
+                            predicateProperty.equals("custom_model_data"));
                     collect(entry.get("model"), append(predicates, predicate),
                             false, compositeLayer, output, warnings, depth + 1);
                 }
@@ -322,11 +342,14 @@ final class JavaItemModelResolver {
         JsonObject predicate = new JsonObject();
         predicate.addProperty("type", "condition");
         predicate.addProperty("property", property);
-        if (property.equals("custom_model_data")) copyIndex(node, predicate);
+        if (property.equals("custom_model_data"))
+            copyIndex(node, predicate, true);
         if (property.equals("has_component")) {
+            if (hasIgnoredDefaultComponentCondition(node)) return null;
             String component = primitive(node.get("component"));
-            if (component == null) return null;
-            predicate.addProperty("component", normalizeIdentifier(component));
+            String normalized = normalizeIdentifier(component);
+            if (normalized == null) return null;
+            predicate.addProperty("component", normalized);
         }
         return predicate;
     }
@@ -360,6 +383,40 @@ final class JavaItemModelResolver {
             case "custom_model_data" -> "custom_model_data";
             default -> null;
         };
+    }
+
+    private String matchValue(String property, String value) {
+        if (value == null) return null;
+        if (property.equals("custom_model_data")) return value;
+        String normalized = value.trim().toLowerCase(Locale.ROOT);
+        if (property.equals("charge_type"))
+            return normalized.equals("arrow") || normalized.equals("rocket")
+                    ? normalized : null;
+        if (property.equals("trim_material")
+                || property.equals("context_dimension"))
+            return normalizeIdentifier(normalized);
+        return normalized;
+    }
+
+    private boolean hasIgnoredDefaultComponentCondition(JsonObject object) {
+        if (!shortProperty(property(object)).equals("has_component")) return false;
+        JsonElement value = object.get("ignore_default");
+        return value != null && value.isJsonPrimitive()
+                && value.getAsJsonPrimitive().isBoolean()
+                && value.getAsBoolean();
+    }
+
+    private void copyRangeNormalization(
+            JsonObject source, JsonObject target, String property) {
+        // Java defaults these two item-model properties to normalized values,
+        // while a Geyser range predicate defaults normalize to false.
+        if (!property.equals("count") && !property.equals("damage")) return;
+        JsonElement configured = source.get("normalize");
+        boolean normalize = configured == null
+                || !configured.isJsonPrimitive()
+                || !configured.getAsJsonPrimitive().isBoolean()
+                || configured.getAsBoolean();
+        target.addProperty("normalize", normalize);
     }
 
     private String property(JsonObject object) {
@@ -407,20 +464,41 @@ final class JavaItemModelResolver {
         if (value.isJsonArray()) {
             List<String> result = new ArrayList<>();
             for (JsonElement child : value.getAsJsonArray())
-                if (child.isJsonPrimitive()) result.add(child.getAsString());
+                if (child.isJsonPrimitive()
+                        && child.getAsJsonPrimitive().isString())
+                    result.add(child.getAsString());
             return result;
         }
-        return value.isJsonPrimitive() ? List.of(value.getAsString()) : List.of();
+        return value.isJsonPrimitive()
+                && value.getAsJsonPrimitive().isString()
+                ? List.of(value.getAsString()) : List.of();
     }
 
-    private void copyIndex(JsonObject source, JsonObject target) {
-        if (source.has("index") && source.get("index").isJsonPrimitive())
-            target.add("index", source.get("index").deepCopy());
+    private void copyIndex(
+            JsonObject source, JsonObject target, boolean defaultToZero) {
+        JsonElement value = source.get("index");
+        if (finiteNumber(value)) {
+            double number = value.getAsDouble();
+            if (number >= 0 && number == Math.rint(number)) {
+                target.addProperty("index", value.getAsInt());
+                return;
+            }
+        }
+        if (defaultToZero) target.addProperty("index", 0);
     }
 
     private String normalizeIdentifier(String value) {
-        String clean = value.toLowerCase(Locale.ROOT).replace('\\', '/');
+        if (value == null) return null;
+        String clean = value.trim().toLowerCase(Locale.ROOT)
+                .replace('\\', '/');
+        if (clean.isEmpty()) return null;
         return clean.contains(":") ? clean : "minecraft:" + clean;
+    }
+
+    private boolean finiteNumber(JsonElement value) {
+        if (value == null || !value.isJsonPrimitive()
+                || !value.getAsJsonPrimitive().isNumber()) return false;
+        return Double.isFinite(value.getAsDouble());
     }
 
     private String normalize(String value) {

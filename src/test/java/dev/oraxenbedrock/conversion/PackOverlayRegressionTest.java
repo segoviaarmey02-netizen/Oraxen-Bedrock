@@ -102,6 +102,7 @@ class PackOverlayRegressionTest {
         predicate.addProperty("property", "broken");
         JsonObject definition = new JsonObject();
         definition.addProperty("bedrock_identifier", "oraxen:test");
+        definition.addProperty("model", "oraxen:test");
         definition.add("predicate", predicate);
         JsonArray definitions = new JsonArray();
         definitions.add(definition);

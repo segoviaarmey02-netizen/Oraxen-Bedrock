@@ -47,7 +47,9 @@ final class LegacyJavaItemModelResolver {
             return new Result(current, false, List.of(), List.of());
 
         List<String> warnings = new ArrayList<>();
-        List<JavaItemModelResolver.Variant> variants = new ArrayList<>();
+        var variantsByPredicate =
+                new java.util.LinkedHashMap<String,
+                        JavaItemModelResolver.Variant>();
         Set<String> visited = new LinkedHashSet<>();
         boolean found = false;
 
@@ -74,7 +76,7 @@ final class LegacyJavaItemModelResolver {
                 JsonObject predicate = override.has("predicate")
                         && override.get("predicate").isJsonObject()
                         ? override.getAsJsonObject("predicate") : new JsonObject();
-                if (target == null) continue;
+                if (target == null || target.isBlank()) continue;
 
                 ConvertedPredicates converted = convertPredicates(
                         predicate, customModelData, current, warnings);
@@ -93,7 +95,19 @@ final class LegacyJavaItemModelResolver {
                     levelVariants.add(new JavaItemModelResolver.Variant(
                             normalizedTarget, copy(alternative)));
             }
-            variants.addAll(levelVariants);
+            /*
+             * Java uses the last matching override within one model, but an
+             * override selected in this (outer) model prevents state
+             * overrides from the baseline child model from being reached.
+             * Deduplicate each level last-wins, then retain the first level
+             * that defines a given predicate.
+             */
+            var levelByPredicate =
+                    new java.util.LinkedHashMap<String,
+                            JavaItemModelResolver.Variant>();
+            for (JavaItemModelResolver.Variant variant : levelVariants)
+                levelByPredicate.put(predicateKey(variant.predicates()), variant);
+            levelByPredicate.forEach(variantsByPredicate::putIfAbsent);
             if (nextBaseline == null || nextBaseline.equals(current)) break;
             current = nextBaseline;
         }
@@ -105,15 +119,13 @@ final class LegacyJavaItemModelResolver {
          * also turns the standard crossbow pair (charged, then firework) into
          * an arrow mapping plus the later rocket mapping without ambiguity.
          */
-        var uniqueByPredicate =
-                new java.util.LinkedHashMap<String, JavaItemModelResolver.Variant>();
-        for (JavaItemModelResolver.Variant variant : variants) {
-            if (variant.model().equals(current) && variant.predicates().isEmpty())
-                continue;
-            String key = JsonSupport.GSON.toJson(variant.predicates());
-            uniqueByPredicate.put(key, variant);
-        }
-        return new Result(current, found, List.copyOf(uniqueByPredicate.values()),
+        List<JavaItemModelResolver.Variant> variants = new ArrayList<>();
+        for (JavaItemModelResolver.Variant variant
+                : variantsByPredicate.values())
+            if (!variant.model().equals(current)
+                    || !variant.predicates().isEmpty())
+                variants.add(variant);
+        return new Result(current, found, List.copyOf(variants),
                 List.copyOf(new LinkedHashSet<>(warnings)));
     }
 
@@ -147,6 +159,7 @@ final class LegacyJavaItemModelResolver {
                     }
                 }
                 case "damage" -> {
+                    if (threshold > 1) return new ConvertedPredicates(false, List.of());
                     if (threshold > 0) {
                         appendAll(alternatives, range("damage", threshold, true));
                         hasDynamicPredicate = true;
@@ -172,6 +185,8 @@ final class LegacyJavaItemModelResolver {
                     // valid Geyser charge types.
                 }
                 case "pulling", "pull", "blocking" -> {
+                    if (threshold > 1)
+                        return new ConvertedPredicates(false, List.of());
                     if (threshold > 0) {
                         warnings.add("Legacy Java predicate '" + property
                                 + "' in '" + owner + "' has no Geyser v2 item "
@@ -269,6 +284,13 @@ final class LegacyJavaItemModelResolver {
                 predicates.stream().map(JsonObject::deepCopy).toList());
     }
 
+    private String predicateKey(List<JsonObject> predicates) {
+        return predicates.stream()
+                .map(JsonSupport.GSON::toJson)
+                .sorted()
+                .collect(java.util.stream.Collectors.joining("\n"));
+    }
+
     private boolean positive(JsonObject source, String property) {
         for (var entry : source.entrySet())
             if (shortProperty(entry.getKey()).equals(property)) {
@@ -279,9 +301,10 @@ final class LegacyJavaItemModelResolver {
     }
 
     private Double number(JsonElement value) {
-        return value != null && value.isJsonPrimitive()
-                && value.getAsJsonPrimitive().isNumber()
-                ? value.getAsDouble() : null;
+        if (value == null || !value.isJsonPrimitive()
+                || !value.getAsJsonPrimitive().isNumber()) return null;
+        double number = value.getAsDouble();
+        return Double.isFinite(number) ? number : null;
     }
 
     private String shortProperty(String property) {
@@ -291,7 +314,7 @@ final class LegacyJavaItemModelResolver {
     }
 
     private String normalize(String value) {
-        String normalized = value.replace('\\', '/')
+        String normalized = value.trim().replace('\\', '/')
                 .replaceFirst("(?i)\\.json$", "");
         if (normalized.startsWith("assets/")) {
             String asset = normalized.substring("assets/".length());
