@@ -272,3 +272,4 @@ Commands:
 - `/oraxenbedrock status`
 
 Permission: `oraxenbedrock.admin`.
+fix
